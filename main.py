@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -115,12 +115,94 @@ register_report_fonts()
 
 
 class SiteRequest(BaseModel):
-    address: str
+    address: str = ""
     lat: Optional[float] = None
     lng: Optional[float] = None
     polygon: Optional[Union[List[List[float]], str]] = None
     force_geocode: bool = False
     chip_size_m: Optional[int] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_frontend_payload(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        data = dict(values)
+
+        # Map frontend/localStorage keys to backend keys
+        if not data.get("address") and data.get("selectedAddress"):
+            data["address"] = data.get("selectedAddress", "")
+
+        if data.get("lat") is None or data.get("lng") is None:
+            centroid = (
+                data.get("lotCentroid")
+                or data.get("lot_centroid")
+                or data.get("centroid")
+            )
+
+            if centroid:
+                try:
+                    if isinstance(centroid, str):
+                        centroid = json.loads(centroid)
+
+                    if isinstance(centroid, list) and len(centroid) >= 2:
+                        # Stored as [lng, lat]
+                        data["lng"] = float(centroid[0])
+                        data["lat"] = float(centroid[1])
+                except Exception:
+                    pass
+
+        if not data.get("polygon"):
+            polygon_candidate = (
+                data.get("lotPolygon")
+                or data.get("lot_polygon")
+                or data.get("lotGeojson")
+                or data.get("lot_geojson")
+                or data.get("polygon")
+            )
+
+            if polygon_candidate:
+                try:
+                    if isinstance(polygon_candidate, str):
+                        parsed = json.loads(polygon_candidate)
+                    else:
+                        parsed = polygon_candidate
+
+                    # Full GeoJSON feature
+                    if isinstance(parsed, dict):
+                        geometry = parsed.get("geometry", {})
+                        if geometry.get("type") == "Polygon":
+                            coords = geometry.get("coordinates", [])
+                            if coords and isinstance(coords[0], list):
+                                data["polygon"] = coords[0]
+
+                    # Already a polygon ring [[lng, lat], ...]
+                    elif (
+                        isinstance(parsed, list)
+                        and parsed
+                        and isinstance(parsed[0], list)
+                        and len(parsed[0]) == 2
+                    ):
+                        data["polygon"] = parsed
+
+                    # Polygon coordinates [[[lng, lat], ...]]
+                    elif (
+                        isinstance(parsed, list)
+                        and parsed
+                        and isinstance(parsed[0], list)
+                        and parsed[0]
+                        and isinstance(parsed[0][0], list)
+                    ):
+                        data["polygon"] = parsed[0]
+
+                except Exception:
+                    pass
+
+        if not data.get("address"):
+            data["address"] = ""
+
+        return data
 
     @field_validator("polygon", mode="before")
     @classmethod
@@ -152,7 +234,7 @@ class SiteRequest(BaseModel):
                 raise ValueError("Polygon coordinates must be numeric.")
 
         return value
-
+    
 
 @app.get("/")
 def root():
