@@ -4782,6 +4782,14 @@ def build_report_pdf(
     years_scanned = sorted({int(img.get("year")) for img in images if isinstance(img.get("year"), int)})
     years_scanned_text = ", ".join(str(y) for y in years_scanned) if years_scanned else "Current imagery only"
 
+    # Surgical page-1 fit fix:
+    # if the address wraps longer, slightly reduce the overview image so it stays on page 1.
+    overview_width_mm = 95
+    if len(safe_str(matched_address)) >= 62:
+        overview_width_mm = 82
+    if len(safe_str(matched_address)) >= 82:
+        overview_width_mm = 74
+
     brief = select_brief_report_features(distinct_features)
     selected_images = choose_report_images(images)
     boundary_overview_img = choose_boundary_overview_image(images)
@@ -4822,7 +4830,7 @@ def build_report_pdf(
         story.append(make_underlined_heading("Current Site Overview", styles))
         image_bytes = fetch_image_bytes(report_display_url(boundary_overview_img, keep_boundary_overlay=True))
         if image_bytes:
-            fig = centered_flowable(AnnotatedImageFlowable(image_bytes, [], width_mm=95), total_width_mm=160)
+            fig = centered_flowable(AnnotatedImageFlowable(image_bytes, [], width_mm=overview_width_mm), total_width_mm=160)
             story.append(make_figure_panel(fig, "Figure 1: Current site overview used for automated screening.", styles, width_mm=170))
         story.append(Spacer(1, 3 * mm))
 
