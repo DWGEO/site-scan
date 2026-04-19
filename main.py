@@ -896,55 +896,66 @@ def classify_cluster_feature(feature: Dict[str, Any], image_lookup: Dict[str, Di
 
     raw_type = safe_str(f.get("feature_type"), "other").lower()
 
-    ever_looked_like_pond = (
-        raw_type in ("water_candidate", "probable_pond", "pond", "former_pond")
-        or water_score >= 1
-        or any(k in text for k in [
-            "pond", "water", "wet", "basin", "depression",
-            "vegetated ring", "circular", "round", "former pond",
-            "wet area", "wet hollow", "water body", "waterbody"
-        ])
-    )
+    is_canal_signal = any(k in text for k in [
+        "canal", "estate canal", "tidal canal", "linear canal", "rear boundary canal", "waterway"
+    ])
+    is_linear_drainage_signal = any(k in text for k in [
+        "creek", "drainage", "drain", "linear water", "channel"
+    ])
 
-    strong_current_open_water = (
-        current_seen and (
-            any(k in text for k in [
-                "current water", "current open water", "open water currently",
-                "standing water visible", "visible water currently present",
-                "still visible in current imagery", "current water visible",
-                "visible in current imagery with water", "open water"
-            ])
-            or ("dark water" in text and "current" in text)
-        )
-    )
-
-    narrow_drainage = any(k in text for k in ["creek", "drainage", "drain", "linear water", "channel"])
-    strong_building_only = building_score >= 1 and water_score == 0
-    mixed_but_disturbance_led = (building_score >= 1 or disturbance_score >= 2) and not strong_current_open_water and water_score <= 1
-
-    if raw_type == "drainage_candidate" or narrow_drainage:
+    if raw_type in ("existing_structure", "former_structure"):
+        final_type = raw_type
+    elif raw_type == "canal" or is_canal_signal:
+        final_type = "canal"
+    elif raw_type == "drainage_feature" or (is_linear_drainage_signal and not is_canal_signal):
         final_type = "drainage_feature"
-    elif strong_building_only:
-        final_type = "disturbance"
-    elif mixed_but_disturbance_led and not historical_seen:
-        final_type = "disturbance"
-    elif disturbance_score >= 3 and not ever_looked_like_pond:
-        final_type = "disturbance"
-    elif ever_looked_like_pond and disturbance_score < 2 and building_score == 0:
-        if strong_current_open_water or (current_seen and likely_current_visible(f)):
-            final_type = "pond"
-        elif historical_seen:
-            final_type = "former_pond"
-        elif current_seen:
-            final_type = "pond"
-        else:
-            final_type = "probable_pond"
-    elif ever_looked_like_pond and historical_seen and water_score >= 2 and building_score == 0:
-        final_type = "former_pond" if not current_seen else "pond"
-    elif disturbance_score >= 1 or building_score >= 1:
-        final_type = "disturbance"
     else:
-        final_type = "other"
+        ever_looked_like_pond = (
+            raw_type in ("water_candidate", "probable_pond", "pond", "former_pond")
+            or water_score >= 1
+            or any(k in text for k in [
+                "pond", "water", "wet", "basin", "depression",
+                "vegetated ring", "circular", "round", "former pond",
+                "wet area", "wet hollow", "water body", "waterbody"
+            ])
+        )
+
+        strong_current_open_water = (
+            current_seen and (
+                any(k in text for k in [
+                    "current water", "current open water", "open water currently",
+                    "standing water visible", "visible water currently present",
+                    "still visible in current imagery", "current water visible",
+                    "visible in current imagery with water", "open water"
+                ])
+                or ("dark water" in text and "current" in text)
+            )
+        )
+
+        strong_building_only = building_score >= 1 and water_score == 0
+        mixed_but_disturbance_led = (building_score >= 1 or disturbance_score >= 2) and not strong_current_open_water and water_score <= 1
+
+        if strong_building_only:
+            final_type = "existing_structure" if current_seen else "former_structure" if historical_seen else "existing_structure"
+        elif mixed_but_disturbance_led and not historical_seen:
+            final_type = "disturbance"
+        elif disturbance_score >= 3 and not ever_looked_like_pond:
+            final_type = "disturbance"
+        elif ever_looked_like_pond and disturbance_score < 2 and building_score == 0:
+            if strong_current_open_water or (current_seen and likely_current_visible(f)):
+                final_type = "pond"
+            elif historical_seen:
+                final_type = "former_pond"
+            elif current_seen:
+                final_type = "pond"
+            else:
+                final_type = "probable_pond"
+        elif ever_looked_like_pond and historical_seen and water_score >= 2 and building_score == 0:
+            final_type = "former_pond" if not current_seen else "pond"
+        elif disturbance_score >= 1 or building_score >= 1:
+            final_type = "disturbance"
+        else:
+            final_type = "other"
 
     f["feature_type"] = final_type
     f["source_image_labels"] = labels
@@ -954,11 +965,9 @@ def classify_cluster_feature(feature: Dict[str, Any], image_lookup: Dict[str, Di
 
     if final_type == "former_pond":
         f["risk_priority"] = "primary" if safe_str(f.get("location_relation"), "") == "on_site" else "contextual"
-    elif final_type in ("pond", "probable_pond"):
+    elif final_type in ("pond", "probable_pond", "disturbance", "existing_structure", "former_structure"):
         f["risk_priority"] = "secondary" if safe_str(f.get("location_relation"), "") == "on_site" else "contextual"
-    elif final_type == "disturbance":
-        f["risk_priority"] = "secondary" if safe_str(f.get("location_relation"), "") == "on_site" else "contextual"
-    elif final_type == "drainage_feature":
+    elif final_type in ("drainage_feature", "canal"):
         f["risk_priority"] = "contextual"
     else:
         f["risk_priority"] = safe_str(f.get("risk_priority"), "secondary")
@@ -970,8 +979,6 @@ def classify_cluster_feature(feature: Dict[str, Any], image_lookup: Dict[str, Di
         f["primary_image_label"] = choose_best_annotation_label(f, image_lookup)
 
     return f
-
-
 
 def dedupe_preserve_order(items: List[Any]) -> List[Any]:
     out = []
@@ -1087,14 +1094,15 @@ def feature_historical_visible(feature: Dict[str, Any]) -> bool:
 
 def cluster_family(feature: Dict[str, Any]) -> str:
     ftype = safe_str(feature.get("feature_type"), "other")
-    if ftype in ("pond", "former_pond", "probable_pond", "depression"):
+    if ftype in ("pond", "former_pond", "probable_pond", "depression", "canal"):
         return "water"
     if ftype in ("disturbance", "fill_area"):
         return "disturbance"
     if ftype == "drainage_feature":
         return "drainage"
+    if ftype in ("existing_structure", "former_structure"):
+        return "structure"
     return "other"
-
 
 def should_cluster_same_feature(f1: Dict[str, Any], f2: Dict[str, Any]) -> bool:
     b1 = safe_dict(f1.get("geo_bbox"))
@@ -1724,7 +1732,9 @@ def build_truth_flags_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     former_ponds = [f for f in on_site if safe_str(f.get("feature_type"), "") == "former_pond"]
     probable_ponds = [f for f in on_site if safe_str(f.get("feature_type"), "") == "probable_pond"]
     disturbances = [f for f in on_site if safe_str(f.get("feature_type"), "") in ("disturbance", "fill_area")]
-    adjacent_water = [f for f in adjacent if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "drainage_feature")]
+    structures = [f for f in on_site if safe_str(f.get("feature_type"), "") in ("existing_structure", "former_structure")]
+    canals = [f for f in adjacent if safe_str(f.get("feature_type"), "") == "canal"]
+    adjacent_water = [f for f in adjacent if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "drainage_feature", "canal")]
 
     return {
         "truth_features": truth_features,
@@ -1732,19 +1742,24 @@ def build_truth_flags_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         "former_ponds": former_ponds,
         "probable_ponds": probable_ponds,
         "disturbances": disturbances,
+        "structures": structures,
+        "canals": canals,
         "adjacent_water": adjacent_water,
         "has_current_pond": bool(current_ponds),
         "has_former_pond": bool(former_ponds),
         "has_probable_pond": bool(probable_ponds),
         "has_disturbance": bool(disturbances),
+        "has_structures": bool(structures),
+        "has_canal": bool(canals),
         "has_adjacent_water": bool(adjacent_water),
         "current_pond_count": len(current_ponds),
         "former_pond_count": len(former_ponds),
         "probable_pond_count": len(probable_ponds),
         "disturbance_count": len(disturbances),
+        "structure_count": len(structures),
+        "canal_count": len(canals),
         "adjacent_water_count": len(adjacent_water),
     }
-
 
 def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str, str]:
     flags = build_truth_flags_from_features(features)
@@ -1753,6 +1768,8 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     former_ponds = flags["former_ponds"]
     probable_ponds = flags["probable_ponds"]
     disturbances = flags["disturbances"]
+    structures = flags["structures"]
+    canals = flags["canals"]
     adjacent_water = flags["adjacent_water"]
 
     if current_ponds and former_ponds:
@@ -1768,9 +1785,14 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     else:
         summary = "No on-site water features were carried through the final interpretation from available imagery."
 
-    if disturbances:
+    if structures:
+        summary += " Existing or former built footprints are also visible on-site."
+    elif disturbances:
         summary += " Site disturbance or possible fill-related ground modification is also visible."
-    if adjacent_water:
+
+    if canals:
+        summary += " An adjacent canal / linear waterway was identified outside the site boundary and treated as contextual only."
+    elif adjacent_water:
         summary += " Adjacent off-site water features were identified and treated as contextual only."
 
     if current_ponds:
@@ -1796,10 +1818,14 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     else:
         on_site_summary = "No current on-site water bodies were carried through the final interpretation."
 
-    if disturbances:
+    if structures:
+        on_site_summary += " Existing or former built footprints are also visible on-site."
+    elif disturbances:
         on_site_summary += " Disturbance or possible fill-related ground modification is also visible on-site."
 
-    if adjacent_water:
+    if canals:
+        adjacent_summary = f"{len(canals)} adjacent canal / linear water feature{'s were' if len(canals) != 1 else ' was'} identified outside the site boundary and treated as contextual only."
+    elif adjacent_water:
         adjacent_summary = f"{len(adjacent_water)} adjacent water feature{'s were' if len(adjacent_water) != 1 else ' was'} identified outside the site boundary and treated as contextual only."
     else:
         adjacent_summary = "No significant adjacent water features were carried through the final interpretation."
@@ -1810,8 +1836,8 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         screening = "Historical imagery indicates former or possible former pond / wet depression signatures on-site. Detailed geotechnical investigation is strongly recommended."
     elif current_ponds:
         screening = "A current on-site water feature is present and should be considered in geotechnical assessment. Detailed geotechnical investigation is strongly recommended."
-    elif disturbances:
-        screening = "No on-site water features were carried through the final interpretation; however, local disturbance or possible fill-related ground modification is visible. Detailed geotechnical investigation is strongly recommended."
+    elif disturbances or structures:
+        screening = "No on-site water features were carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
         screening = "No on-site water features were carried through the final interpretation from available imagery. Normal geotechnical due diligence still applies."
 
@@ -1821,10 +1847,6 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         "adjacent_context_summary": dedupe_sentences(adjacent_summary),
         "screening_outcome": dedupe_sentences(screening),
     }
-
-
-
-
 
 def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     flags = build_truth_flags_from_features(features)
@@ -1836,15 +1858,25 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
             for f in flags.get("disturbances", [])
         ]
     ).lower()
+    structure_text_blob = " ".join(
+        [
+            safe_str(f.get("notes"), "") + " " + " ".join([str(x) for x in safe_list(f.get("evidence"))])
+            for f in flags.get("structures", [])
+        ]
+    ).lower()
     all_on_site_blob = " ".join(
         safe_str(f.get("notes"), "") + " " + " ".join([str(x) for x in safe_list(f.get("evidence"))])
         for f in flags.get("truth_features", [])
         if safe_str(f.get("location_relation"), "") == "on_site"
     ).lower()
-    building_related_disturbance = has_structure_or_hardstand_signal(disturbance_text_blob) or has_structure_or_hardstand_signal(all_on_site_blob)
+    building_related_disturbance = (
+        has_structure_or_hardstand_signal(disturbance_text_blob)
+        or has_structure_or_hardstand_signal(structure_text_blob)
+        or has_structure_or_hardstand_signal(all_on_site_blob)
+    )
     has_embedded_disturbance_signal = has_strong_disturbance_signal(disturbance_text_blob) or has_strong_disturbance_signal(all_on_site_blob)
 
-    if flags.get("has_disturbance") or building_related_disturbance or has_embedded_disturbance_signal:
+    if flags.get("has_disturbance") or flags.get("has_structures") or building_related_disturbance or has_embedded_disturbance_signal:
         risks.append({
             "title": "Disturbance / Fill Risk",
             "level": "ELEVATED",
@@ -1854,8 +1886,8 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
                 "This can result in variable strength, moisture conditions, and overall soil behaviour, which may impact foundation "
                 "performance and footing type, and contribute to differential settlement if not properly assessed in accordance with AS2870."
                 if not building_related_disturbance else
-                "Existing building / hardstand footprints and associated site disturbance indicate prior localised ground modification may have occurred. "
-                "These areas can be associated with regrading, hardstand construction, service installation, slab preparation, or localised fill placement. "
+                "Existing or former building / hardstand footprints and associated site disturbance indicate prior localised ground modification may have occurred. "
+                "These areas can be associated with regrading, hardstand construction, service installation, slab preparation, demolition, or localised fill placement. "
                 "The origin and composition of any modified ground remain unknown at this stage and may contribute to variable near-surface conditions, "
                 "foundation performance issues, or differential settlement if not properly assessed in accordance with AS2870."
             ),
@@ -1884,6 +1916,17 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
                 "compressible soils, and conditions that may contribute to ground movement. These areas may remain seasonally wet or act "
                 "as surface water collection points, which can impact foundation performance and are relevant to site classification "
                 "considerations in accordance with AS2870."
+            ),
+        })
+
+    if flags.get("has_canal"):
+        risks.append({
+            "title": "Adjacent Canal / Waterway Context",
+            "level": "MODERATE",
+            "text": (
+                "An adjacent canal or linear waterway has been identified outside the site boundary. "
+                "This has been treated as contextual rather than as an on-site pond feature; however, nearby water may still be relevant to "
+                "local groundwater conditions, moisture influence, and geotechnical investigation planning."
             ),
         })
 
@@ -3115,9 +3158,12 @@ Return valid JSON only in this structure:
 }}
 
 RULES:
-- Water candidate = ANY visible water-related feature including pond, former pond, old dam footprint, vegetated-ring waterbody, irregular basin, elongated pond, semi-circular pond, disconnected water patch, wet depression, or partially infilled water feature.
+- Water candidate = isolated or basin-like visible water-related feature including pond, former pond, old dam footprint, vegetated-ring waterbody, irregular basin, disconnected water patch, wet depression, or partially infilled water feature.
+- Canal / estate canal / tidal canal / linear waterway along a site boundary should NOT be called a pond. Return it as drainage_candidate with notes clearly saying canal or linear waterway.
+- Pond = isolated basin / depression. Canal = long linear connected waterbody that continues beyond the site.
 - Disturbance candidate = obvious fill area / cleared soil / earthworks / access disturbance / disturbed pad / bare reworked ground.
-- Structure candidate = obvious existing dwelling, house, shed, slab, driveway, hardstand, building pad, or other clear built footprint that may indicate prior site disturbance.
+- Structure candidate = obvious existing or former dwelling, house, shed, slab, driveway, hardstand, building pad, or other clear built footprint that may indicate prior site disturbance.
+- Where historical imagery shows a removed dwelling / slab / hardstand, still return it as structure_candidate and make the notes say former structure or removed building footprint.
 - Clearly defined roofs, rectangular slabs, hardstand areas, and sharp-edged building pads MUST be identified as structure_candidate where visible.
 - Structures should still be identified even if partly obscured by vegetation.
 - Large cleared pads with sharp edges may indicate building platforms or hardstand and should be returned as structure_candidate or earthworks_candidate where appropriate.
@@ -3208,31 +3254,43 @@ def build_features_from_candidates(candidates: List[Dict[str, Any]]) -> List[Dic
         raw_type = safe_str(feature.get("feature_type"), "other").lower()
         notes = safe_str(feature.get("notes"), "")
         evidence = [str(x) for x in safe_list(feature.get("evidence"))]
+        text_blob = (notes + " " + " ".join(evidence)).lower()
 
         if raw_type == "water_candidate":
             feature["feature_type"] = "probable_pond"
+
         elif raw_type == "structure_candidate":
-            feature["feature_type"] = "disturbance"
-            if not any(k in notes.lower() for k in ["building", "dwelling", "house", "shed", "slab", "hardstand", "driveway", "structure", "roof"]):
-                prefix = "Existing building / hardstand footprint visible"
+            historical_hint = any(
+                k in text_blob for k in [
+                    "former structure", "former dwelling", "removed structure", "demolished",
+                    "old slab", "historical slab", "historical dwelling", "prior building"
+                ]
+            )
+            feature["feature_type"] = "former_structure" if historical_hint else "existing_structure"
+            if not any(k in text_blob for k in ["building", "dwelling", "house", "shed", "slab", "hardstand", "driveway", "structure", "roof"]):
+                prefix = "Existing building / hardstand footprint visible" if not historical_hint else "Former building / hardstand footprint visible in historical imagery"
                 feature["notes"] = f"{prefix}. {notes}".strip().strip(".")
             extra_evidence = [
-                "existing building footprint visible",
+                "building footprint visible" if not historical_hint else "former building footprint visible",
                 "possible prior localised ground modification",
             ]
             feature["evidence"] = merge_string_lists(evidence + extra_evidence)
+
         elif raw_type in ("disturbance_candidate", "earthworks_candidate", "stockpile_candidate"):
-            # Keep surgical: fold obvious non-water geotechnical indicators into the existing disturbance pathway
-            # so the working reporting / truth-layer logic remains stable.
             feature["feature_type"] = "disturbance"
+
         elif raw_type == "drainage_candidate":
-            feature["feature_type"] = "other"
-            if "creek" not in notes.lower() and "drain" not in notes.lower():
-                feature["notes"] = (notes + " drainage/creek-like linear water feature").strip()
+            if any(k in text_blob for k in ["canal", "estate canal", "linear canal", "tidal canal", "waterway", "rear boundary canal"]):
+                feature["feature_type"] = "canal"
+                if "canal" not in text_blob:
+                    feature["notes"] = (notes + " linear canal / waterway feature").strip()
+            else:
+                feature["feature_type"] = "drainage_feature"
+                if "creek" not in text_blob and "drain" not in text_blob and "channel" not in text_blob:
+                    feature["notes"] = (notes + " drainage/creek-like linear water feature").strip()
 
         built.append(normalize_feature(feature))
     return built
-
 
 def upgrade_geotech_features(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     upgraded: List[Dict[str, Any]] = []
@@ -3357,8 +3415,12 @@ def assign_stable_feature_ids(features: List[Dict[str, Any]]) -> List[Dict[str, 
     ]
     adjacent_water = [
         f for f in features
-        if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "drainage_feature")
+        if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "drainage_feature", "canal")
         and safe_str(f.get("location_relation"), "") != "on_site"
+    ]
+    structures = [
+        f for f in features
+        if safe_str(f.get("feature_type"), "") in ("existing_structure", "former_structure")
     ]
 
     on_site_sorted = sorted(on_site_water, key=feature_sort_key_for_ids)
@@ -3367,13 +3429,29 @@ def assign_stable_feature_ids(features: List[Dict[str, Any]]) -> List[Dict[str, 
         feature["feature_id"] = f"Pond {letters[idx] if idx < len(letters) else idx + 1}"
 
     adj_count = 0
+    canal_count = 0
     for feature in sorted(adjacent_water, key=feature_sort_key_for_ids):
+        ftype = safe_str(feature.get("feature_type"), "")
         notes = (safe_str(feature.get("notes"), "") + " " + " ".join([str(x) for x in safe_list(feature.get("evidence"))])).lower()
-        if "creek" in notes or "drainage" in notes or safe_str(feature.get("feature_type"), "") == "drainage_feature":
+        if ftype == "canal" or "canal" in notes:
+            canal_count += 1
+            feature["feature_id"] = "Adjacent Canal" if canal_count == 1 else f"Adjacent Canal {canal_count}"
+        elif "creek" in notes or "drainage" in notes or ftype == "drainage_feature":
             feature["feature_id"] = "Adjacent Creek"
         else:
             adj_count += 1
             feature["feature_id"] = f"Adjacent Pond {adj_count}"
+
+    existing_count = 0
+    former_count = 0
+    for feature in sorted(structures, key=feature_sort_key_for_ids):
+        ftype = safe_str(feature.get("feature_type"), "")
+        if ftype == "former_structure":
+            former_count += 1
+            feature["feature_id"] = "Former Structure" if former_count == 1 else f"Former Structure {former_count}"
+        else:
+            existing_count += 1
+            feature["feature_id"] = "Existing Structure" if existing_count == 1 else f"Existing Structure {existing_count}"
 
     for feature in features:
         if safe_str(feature.get("feature_id"), "").strip():
@@ -3383,6 +3461,14 @@ def assign_stable_feature_ids(features: List[Dict[str, Any]]) -> List[Dict[str, 
             feature["feature_id"] = "Fill Area"
         elif ftype == "disturbance":
             feature["feature_id"] = "Disturbance Area"
+        elif ftype == "drainage_feature":
+            feature["feature_id"] = "Drainage Feature"
+        elif ftype == "canal":
+            feature["feature_id"] = "Canal"
+        elif ftype == "existing_structure":
+            feature["feature_id"] = "Existing Structure"
+        elif ftype == "former_structure":
+            feature["feature_id"] = "Former Structure"
         else:
             feature["feature_id"] = ftype.replace("_", " ").title()
 
@@ -3426,7 +3512,7 @@ def finalize_feature_geometry_and_ids(
     # Keep only meaningful final feature types for report output.
     processed = [
         f for f in processed
-        if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "disturbance", "fill_area", "drainage_feature")
+        if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "disturbance", "fill_area", "drainage_feature", "canal", "existing_structure", "former_structure")
     ]
     # remove duplicate disturbance boxes when they substantially overlap
     tmp=[]
@@ -3457,9 +3543,9 @@ def finalize_feature_geometry_and_ids(
             feature["risk_priority"] = "contextual"
         elif ftype == "former_pond":
             feature["risk_priority"] = "primary"
-        elif ftype in ("pond", "probable_pond", "disturbance", "fill_area"):
+        elif ftype in ("pond", "probable_pond", "disturbance", "fill_area", "existing_structure", "former_structure"):
             feature["risk_priority"] = "secondary"
-        elif ftype == "drainage_feature":
+        elif ftype in ("drainage_feature", "canal"):
             feature["risk_priority"] = "contextual"
 
     return processed
