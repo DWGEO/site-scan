@@ -688,6 +688,8 @@ def collapse_near_identical_features(features: List[Dict[str, Any]]) -> List[Dic
             t2 = safe_str(feature.get("feature_type"), "other")
             if not (is_water_feature_type(t1) and is_water_feature_type(t2)):
                 continue
+            if cluster_family(existing) != cluster_family(feature):
+                continue
             if safe_str(existing.get("location_relation"), "") != safe_str(feature.get("location_relation"), ""):
                 continue
             if is_secondary_pond_like(existing) != is_secondary_pond_like(feature):
@@ -723,7 +725,6 @@ def collapse_near_identical_features(features: List[Dict[str, Any]]) -> List[Dic
         if not matched:
             final.append(dict(feature))
     return final
-
 
 def dedupe_final_anchored_features(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     cleaned: List[Dict[str, Any]] = []
@@ -1773,15 +1774,11 @@ def build_truth_flags_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     raw_features = [dict(f) for f in features if isinstance(f, dict)]
     truth_features = dedupe_truth_features(raw_features)
 
-    # Hard carry-through for buried / former ponds:
-    # if any earlier pass promoted or preserved an on-site former pond, do not let
-    # later "current pond" simplification erase that former-pond risk from the truth layer.
     forced_former_ponds = extract_locked_former_ponds(raw_features)
     for feature in forced_former_ponds:
         matched = False
         for existing in truth_features:
             if should_merge_truth_features(existing, feature):
-                # Keep distinct former-pond risk where a current pond also exists on nearly the same footprint.
                 if safe_str(existing.get("feature_type"), "") == "pond":
                     continue
                 merge_feature_pair(existing, feature)
@@ -1799,8 +1796,24 @@ def build_truth_flags_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     current_ponds = [f for f in on_site if safe_str(f.get("feature_type"), "") == "pond"]
     former_ponds = [f for f in on_site if safe_str(f.get("feature_type"), "") == "former_pond"]
     probable_ponds = [f for f in on_site if safe_str(f.get("feature_type"), "") == "probable_pond"]
-    disturbances = [f for f in on_site if safe_str(f.get("feature_type"), "") in ("disturbance", "fill_area")]
-    adjacent_water = [f for f in adjacent if safe_str(f.get("feature_type"), "") in ("pond", "former_pond", "probable_pond", "drainage_feature")]
+    disturbances = [f for f in on_site if safe_str(f.get("feature_type"), "") in ("disturbance", "fill_area", "retaining_or_cut_fill")]
+    structures = [f for f in on_site if safe_str(f.get("feature_type"), "") in ("existing_structure", "former_structure", "hardstand_or_slab")]
+    reclaimed_ground = [f for f in on_site if safe_str(f.get("feature_type"), "") == "possible_reclaimed_ground"]
+    vegetation = [f for f in on_site if safe_str(f.get("feature_type"), "") == "significant_tree_or_vegetation"]
+
+    canals = [f for f in truth_features if safe_str(f.get("feature_type"), "") == "canal"]
+    drainage_features = [f for f in truth_features if safe_str(f.get("feature_type"), "") == "drainage_feature"]
+    coastal_features = [f for f in truth_features if safe_str(f.get("feature_type"), "") == "beach_foreshore_or_coastal_edge"]
+    external_waterbodies = [f for f in truth_features if safe_str(f.get("feature_type"), "") == "large_external_waterbody"]
+    uncertain_water = [f for f in truth_features if safe_str(f.get("feature_type"), "") == "uncertain_water_related_feature"]
+
+    water_context_types = (
+        "pond", "former_pond", "probable_pond", "drainage_feature", "canal",
+        "beach_foreshore_or_coastal_edge", "large_external_waterbody",
+        "uncertain_water_related_feature"
+    )
+    adjacent_water = [f for f in adjacent if safe_str(f.get("feature_type"), "") in water_context_types]
+    any_water_context = [f for f in truth_features if safe_str(f.get("feature_type"), "") in water_context_types]
 
     return {
         "truth_features": truth_features,
@@ -1808,19 +1821,42 @@ def build_truth_flags_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         "former_ponds": former_ponds,
         "probable_ponds": probable_ponds,
         "disturbances": disturbances,
+        "structures": structures,
+        "reclaimed_ground": reclaimed_ground,
+        "vegetation": vegetation,
+        "canals": canals,
+        "drainage_features": drainage_features,
+        "coastal_features": coastal_features,
+        "external_waterbodies": external_waterbodies,
+        "uncertain_water": uncertain_water,
         "adjacent_water": adjacent_water,
+        "any_water_context": any_water_context,
         "has_current_pond": bool(current_ponds),
         "has_former_pond": bool(former_ponds),
         "has_probable_pond": bool(probable_ponds),
         "has_disturbance": bool(disturbances),
+        "has_structures": bool(structures),
+        "has_reclaimed_ground": bool(reclaimed_ground),
+        "has_vegetation": bool(vegetation),
+        "has_canal": bool(canals),
+        "has_drainage_feature": bool(drainage_features),
+        "has_coastal_feature": bool(coastal_features),
+        "has_external_waterbody": bool(external_waterbodies),
+        "has_uncertain_water": bool(uncertain_water),
         "has_adjacent_water": bool(adjacent_water),
+        "has_any_water_context": bool(any_water_context),
         "current_pond_count": len(current_ponds),
         "former_pond_count": len(former_ponds),
         "probable_pond_count": len(probable_ponds),
         "disturbance_count": len(disturbances),
+        "structure_count": len(structures),
+        "reclaimed_ground_count": len(reclaimed_ground),
+        "canal_count": len(canals),
+        "drainage_feature_count": len(drainage_features),
+        "coastal_feature_count": len(coastal_features),
+        "external_waterbody_count": len(external_waterbodies),
         "adjacent_water_count": len(adjacent_water),
     }
-
 
 def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str, str]:
     flags = build_truth_flags_from_features(features)
@@ -1829,54 +1865,95 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     former_ponds = flags["former_ponds"]
     probable_ponds = flags["probable_ponds"]
     disturbances = flags["disturbances"]
+    structures = flags.get("structures", [])
+    reclaimed_ground = flags.get("reclaimed_ground", [])
+    canals = flags.get("canals", [])
+    drainage_features = flags.get("drainage_features", [])
+    coastal_features = flags.get("coastal_features", [])
+    external_waterbodies = flags.get("external_waterbodies", [])
+    uncertain_water = flags.get("uncertain_water", [])
     adjacent_water = flags["adjacent_water"]
+
+    water_context_parts = []
+    if canals:
+        water_context_parts.append("adjacent canal / engineered waterway context")
+    if drainage_features:
+        water_context_parts.append("creek or drainage context")
+    if coastal_features:
+        water_context_parts.append("foreshore / coastal water context")
+    if external_waterbodies:
+        water_context_parts.append("external waterbody context")
+    if uncertain_water:
+        water_context_parts.append("uncertain water-related context")
+
+    has_water_context = bool(water_context_parts or adjacent_water)
 
     if current_ponds and former_ponds:
         summary = "A current pond is present on-site. Historical imagery also indicates at least one additional former or altered pond / wet depression on-site."
     elif current_ponds and probable_ponds:
         summary = "A current pond is present on-site. Historical imagery also suggests one or more additional secondary pond / wet depression signatures on-site."
     elif former_ponds:
-        summary = "No current on-site water bodies are clearly visible; however, historical imagery indicates former ponds or infilled wet depressions on-site."
+        summary = "No current isolated on-site pond is clearly visible; however, historical imagery indicates former ponds or infilled wet depressions on-site."
     elif current_ponds:
-        summary = "A current pond feature is present on-site."
+        summary = "A current isolated pond feature is present on-site."
     elif probable_ponds:
         summary = "Possible former pond or wet depression signatures are present on-site in historical imagery."
+    elif has_water_context:
+        summary = "No isolated on-site pond was carried through the final interpretation; however, nearby water context was identified and should be considered for abnormal moisture assessment."
     else:
-        summary = "No on-site water features were carried through the final interpretation from available imagery."
+        summary = "No on-site or adjacent water context was carried through the final interpretation from available imagery."
 
-    if disturbances:
+    if reclaimed_ground:
+        summary += " Possible reclaimed or canal-edge fill indicators are also visible on-site."
+    if structures:
+        summary += " Existing or former built footprints are also visible on-site."
+    elif disturbances:
         summary += " Site disturbance or possible fill-related ground modification is also visible."
-    if adjacent_water:
-        summary += " Adjacent off-site water features were identified and treated as contextual only."
+    if water_context_parts:
+        summary += " " + "; ".join(water_context_parts).capitalize() + " was identified and treated as geotechnically relevant context rather than an isolated pond."
+    elif adjacent_water:
+        summary += " Adjacent off-site water features were identified and treated as geotechnically relevant context."
 
     if current_ponds:
         if len(current_ponds) == 1 and former_ponds:
             on_site_summary = (
-                "1 current on-site pond feature is present. "
+                "1 current isolated on-site pond feature is present. "
                 f"{len(former_ponds)} additional former pond feature{'s' if len(former_ponds) != 1 else ''} "
                 f"{'are' if len(former_ponds) != 1 else 'is'} also identified from historical imagery."
             )
         elif len(current_ponds) == 1:
-            on_site_summary = "1 current on-site pond feature is present in the final interpretation."
+            on_site_summary = "1 current isolated on-site pond feature is present in the final interpretation."
         else:
-            on_site_summary = f"{len(current_ponds)} distinct current on-site pond features are present in the final interpretation."
+            on_site_summary = f"{len(current_ponds)} distinct current isolated on-site pond features are present in the final interpretation."
             if former_ponds:
                 on_site_summary += (
                     f" {len(former_ponds)} additional former pond feature{'s' if len(former_ponds) != 1 else ''} "
                     f"{'are' if len(former_ponds) != 1 else 'is'} also identified from historical imagery."
                 )
     elif former_ponds:
-        on_site_summary = f"No current on-site water bodies are clearly visible. Historical imagery indicates {len(former_ponds)} former pond feature{'s' if len(former_ponds) != 1 else ''} or altered wet depressions within the site boundary."
+        on_site_summary = f"No current isolated on-site pond is clearly visible. Historical imagery indicates {len(former_ponds)} former pond feature{'s' if len(former_ponds) != 1 else ''} or altered wet depressions within the site boundary."
     elif probable_ponds:
-        on_site_summary = "No current on-site water bodies are clearly visible. One or more secondary pond / wet depression signatures remain uncertain and should be treated conservatively."
+        on_site_summary = "No current isolated on-site pond is clearly visible. One or more secondary pond / wet depression signatures remain uncertain and should be treated conservatively."
+    elif reclaimed_ground:
+        on_site_summary = "No isolated on-site pond was carried through; however, possible reclaimed or canal-edge fill indicators are visible on-site."
     else:
-        on_site_summary = "No current on-site water bodies were carried through the final interpretation."
+        on_site_summary = "No isolated on-site pond was carried through the final interpretation."
 
-    if disturbances:
+    if structures:
+        on_site_summary += " Existing or former built footprints are also visible on-site."
+    elif disturbances:
         on_site_summary += " Disturbance or possible fill-related ground modification is also visible on-site."
 
-    if adjacent_water:
-        adjacent_summary = f"{len(adjacent_water)} adjacent water feature{'s were' if len(adjacent_water) != 1 else ' was'} identified outside the site boundary and treated as contextual only."
+    if canals:
+        adjacent_summary = f"{len(canals)} adjacent canal / engineered waterway feature{'s were' if len(canals) != 1 else ' was'} identified and treated as abnormal moisture / canal-edge context, not as an isolated pond."
+    elif drainage_features:
+        adjacent_summary = f"{len(drainage_features)} creek or drainage feature{'s were' if len(drainage_features) != 1 else ' was'} identified and treated as abnormal moisture context."
+    elif coastal_features:
+        adjacent_summary = f"{len(coastal_features)} foreshore or coastal water context feature{'s were' if len(coastal_features) != 1 else ' was'} identified and treated as abnormal moisture context."
+    elif external_waterbodies:
+        adjacent_summary = f"{len(external_waterbodies)} nearby external waterbody feature{'s were' if len(external_waterbodies) != 1 else ' was'} identified and treated as abnormal moisture context."
+    elif adjacent_water:
+        adjacent_summary = f"{len(adjacent_water)} adjacent water feature{'s were' if len(adjacent_water) != 1 else ' was'} identified outside the site boundary and treated as abnormal moisture context."
     else:
         adjacent_summary = "No significant adjacent water features were carried through the final interpretation."
 
@@ -1885,11 +1962,15 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     elif former_ponds or probable_ponds:
         screening = "Historical imagery indicates former or possible former pond / wet depression signatures on-site. Detailed geotechnical investigation is strongly recommended."
     elif current_ponds:
-        screening = "A current on-site water feature is present and should be considered in geotechnical assessment. Detailed geotechnical investigation is strongly recommended."
-    elif disturbances:
-        screening = "No on-site water features were carried through the final interpretation; however, local disturbance or possible fill-related ground modification is visible. Detailed geotechnical investigation is strongly recommended."
+        screening = "A current isolated on-site water feature is present and should be considered in geotechnical assessment. Detailed geotechnical investigation is strongly recommended."
+    elif reclaimed_ground or canals:
+        screening = "No isolated on-site pond was carried through; however, adjacent canal / waterway context and possible canal-edge or reclaimed-ground conditions are relevant to abnormal moisture and fill assessment. Detailed geotechnical investigation is strongly recommended."
+    elif drainage_features or coastal_features or external_waterbodies or adjacent_water:
+        screening = "Nearby water context is relevant to abnormal moisture assessment under AS2870-style investigation planning. Detailed geotechnical investigation is strongly recommended."
+    elif disturbances or structures:
+        screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
-        screening = "No on-site water features were carried through the final interpretation from available imagery. Normal geotechnical due diligence still applies."
+        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Normal geotechnical due diligence still applies."
 
     return {
         "summary": dedupe_sentences(summary),
@@ -1897,10 +1978,6 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         "adjacent_context_summary": dedupe_sentences(adjacent_summary),
         "screening_outcome": dedupe_sentences(screening),
     }
-
-
-
-
 
 def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     flags = build_truth_flags_from_features(features)
@@ -3256,6 +3333,9 @@ Return valid JSON only in this structure:
 }}
 
 WATER SETTING CLASSIFICATION — CRITICAL:
+You MUST return a candidate for any visible water body within the site, touching the site boundary, or immediately adjacent to the site in current_site/current_context/current_wide_context imagery.
+Do not ignore adjacent water just because it is outside the lot. Adjacent water is still relevant to abnormal moisture and AS2870-style investigation planning.
+For canal-front residential lots, the rear canal MUST be returned as canal_edge_or_reclaimed_waterway with location_relation=adjacent unless clearly inside the lot.
 Before calling anything a pond, classify the water / wet feature setting as one of:
 1. pond_on_site
    - isolated contained waterbody within the lot boundary
@@ -3291,6 +3371,8 @@ STRICT WATER RULES:
 - Only classify as pond_on_site where the waterbody is isolated, contained, and located inside the lot boundary.
 - If water is adjacent to the site but outside the lot, describe it as contextual unless there is visual evidence that the lot itself was reclaimed, filled, low-lying, or historically part of the waterbody.
 - All water contexts may be relevant to abnormal moisture conditions, but do not overstate direct on-site risk unless the visual evidence is on-site.
+- Adjacent canal / creek / foreshore / external water must still be returned as a contextual feature, not dropped from the candidate list.
+- The correct outcome for a canal-front lot is usually: no isolated on-site pond, but adjacent canal / abnormal moisture / possible canal-edge fill context present.
 
 CANAL / RECLAIMED WATERWAY INTERPRETATION:
 For canal-front or reclaimed-waterway sites, look for:
