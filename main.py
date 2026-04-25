@@ -5221,7 +5221,16 @@ def build_report_pdf(
     distinct_features = safe_list(analysis.get("distinct_features"))
     geotechnical_risks = [r for r in safe_list(analysis.get("geotechnical_risks")) if isinstance(r, dict)]
 
-    matched_address = resolved.get("matched_address") or payload.address
+    def truncate_address(addr, max_len=60):
+        if not addr:
+            return ""
+        if len(addr) <= max_len:
+            return addr
+        return addr[:max_len].rsplit(" ", 1)[0] + "..."
+
+    matched_address = truncate_address(
+        resolved.get("matched_address") or payload.address
+    )
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
     lot_area_text = f"{lot_area_m2:,.0f} m²" if isinstance(lot_area_m2, (int, float)) else "Not available"
     years_scanned = sorted({int(img.get("year")) for img in images if isinstance(img.get("year"), int)})
