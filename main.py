@@ -2012,15 +2012,16 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
             "title": "Disturbance / Fill Risk",
             "level": "ELEVATED",
             "text": (
-                "Visible disturbance within the site suggests that ground modification or placement of fill materials may have occurred. "
-                "The origin and composition of such materials are typically unknown at this stage and may include uncontrolled fill. "
-                "This can result in variable strength, moisture conditions, and overall soil behaviour, which may impact foundation "
-                "performance and footing type, and contribute to differential settlement if not properly assessed in accordance with AS2870."
+                "Visible earthworks or disturbance within the site suggests that ground modification has occurred. "
+                "This may include cut, fill, or a combination of both associated with platform preparation. "
+                "The presence, extent, origin and composition of any placed fill cannot be confirmed from imagery alone. "
+                "Reworked ground may result in variable strength, moisture conditions and overall soil behaviour, which may impact foundation "
+                "performance and footing type if not properly assessed in accordance with AS2870."
                 if not building_related_disturbance else
                 "Existing or former building / hardstand footprints and associated site disturbance indicate prior localised ground modification may have occurred. "
-                "These areas can be associated with regrading, hardstand construction, service installation, slab preparation, demolition, or localised fill placement. "
-                "The origin and composition of any modified ground remain unknown at this stage and may contribute to variable near-surface conditions, "
-                "foundation performance issues, or differential settlement if not properly assessed in accordance with AS2870."
+                "These areas can be associated with regrading, hardstand construction, service installation, slab preparation, demolition, or localised cut/fill works. "
+                "The presence and extent of any placed fill cannot be confirmed from imagery alone. Modified or reworked ground may contribute to variable near-surface conditions, "
+                "foundation performance issues, or differential movement if not properly assessed in accordance with AS2870."
             ),
         })
 
@@ -2157,13 +2158,13 @@ def rebuild_findings_notes_from_features(features: List[Dict[str, Any]]) -> Dict
 
     if disturbances or has_building or has_disturbance_signal:
         if has_building or has_structure_or_hardstand_signal(disturbance_text_blob):
-            fill_status = "likely"
-            fill_conf = "high"
-            fill_note = "Existing building / hardstand footprints and associated on-site disturbance are visible, indicating prior localised ground modification."
+            fill_status = "possible"
+            fill_conf = "medium"
+            fill_note = "Existing building / hardstand footprints and associated on-site disturbance are visible, indicating prior localised ground modification. Cut/fill conditions cannot be confirmed from imagery alone."
         elif disturbances or has_disturbance_signal:
-            fill_status = "likely"
-            fill_conf = "high"
-            fill_note = "Recent on-site disturbance and possible fill-related ground modification are visible."
+            fill_status = "possible"
+            fill_conf = "medium"
+            fill_note = "Recent on-site earthworks or reworked ground are visible. This may include cut, fill, or a combination of both; the presence of placed fill cannot be confirmed from imagery alone."
         else:
             fill_status = "possible"
             fill_conf = "medium"
@@ -3398,6 +3399,19 @@ Look for evidence of:
 - former structures removed between imagery years
 Classify as fill_or_disturbance, possible_reclaimed_ground, retaining_or_cut_fill, hardstand_or_slab, existing_structure, or former_structure as appropriate.
 
+CUT / FILL INTERPRETATION RULE:
+If earthworks, exposed soil, platform preparation, or disturbed ground is observed:
+- Do not assume the presence of fill from exposed soil alone.
+- Do not assume the site is entirely in cut from exposed soil alone.
+- Treat general earthworks as cut/fill platform preparation or reworked ground unless clearer evidence is visible.
+Only infer fill more strongly where there is clear visual evidence such as:
+- the site appears raised relative to surrounding terrain
+- a former depression, pond, waterway, or low area has been infilled
+- historical imagery shows progressive infilling or reclamation
+- retaining walls, batters, or edge geometry indicate placed material
+- a platform extends beyond the natural slope alignment
+If these indicators are not clearly present, describe the condition as earthworks / reworked ground with cut/fill unknown and fill presence unconfirmed.
+
 STRUCTURE CLASSIFICATION:
 Identify separately:
 - existing_structure
@@ -3978,7 +3992,7 @@ def parse_analysis_response(
         if safe_str(feature.get("feature_type"), "") == "former_pond" and safe_str(feature.get("location_relation"), "") == "on_site":
             cleaned_risks.append("Former pond signatures may indicate fill, uncontrolled fill, deep fill, soft ground, or moisture-sensitive soils.")
         elif safe_str(feature.get("feature_type"), "") == "fill_area" and safe_str(feature.get("location_relation"), "") == "on_site":
-            cleaned_risks.append("Disturbed ground may indicate variable near-surface conditions and localised compaction variability.")
+            cleaned_risks.append("Earthworks or reworked ground may indicate cut/fill platform preparation and variable near-surface conditions; fill presence is unconfirmed from imagery alone.")
         elif safe_str(feature.get("feature_type"), "") == "pond" and safe_str(feature.get("location_relation"), "") == "on_site":
             cleaned_risks.append("Active pond areas may indicate local wetness influence and moisture variability in surrounding ground.")
         elif safe_str(feature.get("feature_type"), "") == "possible_reclaimed_ground" and safe_str(feature.get("location_relation"), "") == "on_site":
