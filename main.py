@@ -58,6 +58,15 @@ QLD_IMAGE_SERVER = (
     "TimeSeries/AerialOrtho_AllUsers/ImageServer"
 )
 
+QLD_SURFACE_GEOLOGY_LAYER_URL = (
+    "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/"
+    "GeoscientificInformation/GeologyDetailed/MapServer/15"
+)
+NSW_SEAMLESS_GEOLOGY_LAYER_URL = (
+    "https://mapprod2.environment.nsw.gov.au/arcgis/rest/services/"
+    "Geology/NSW_SeamlessGeology_DLO/MapServer/0"
+)
+
 REQUEST_TIMEOUT = 25
 POLYGON_PAD_M = 8
 CONTEXT_PAD_M = 35
@@ -259,6 +268,144 @@ def safe_get(url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return response.json()
     except Exception:
         return None
+
+
+def pick_first_attr(attributes: Dict[str, Any], keys: List[str]) -> str:
+    lower_map = {str(k).lower(): v for k, v in safe_dict(attributes).items()}
+    for key in keys:
+        value = lower_map.get(key.lower())
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def is_likely_nsw(lat: float, lng: float) -> bool:
+    return (-37.8 <= lat <= -28.0) and (140.5 <= lng <= 154.5)
+
+
+def query_arcgis_point_layer(layer_url: str, lat: float, lng: float) -> Optional[Dict[str, Any]]:
+    params = {
+        "f": "json",
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "geometry": f"{lng},{lat}",
+        "geometryType": "esriGeometryPoint",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "resultRecordCount": 1,
+    }
+    data = safe_get(f"{layer_url}/query", params)
+    if not data:
+        return None
+    features = data.get("features") or []
+    if not features:
+        return None
+    return safe_dict(features[0].get("attributes"))
+
+
+def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    try:
+        lat = float(resolved.get("lat"))
+        lng = float(resolved.get("lng"))
+    except Exception:
+        return None
+
+    source_name = ""
+    source_note = ""
+    attributes = None
+
+    if is_likely_qld(lat, lng):
+        attributes = query_arcgis_point_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, lat, lng)
+        source_name = "QSpatial / GeologyDetailed - Detailed surface geology"
+        source_note = "State of Queensland (Department of Resources), CC BY 4.0"
+    elif is_likely_nsw(lat, lng):
+        attributes = query_arcgis_point_layer(NSW_SEAMLESS_GEOLOGY_LAYER_URL, lat, lng)
+        source_name = "NSW Seamless Geology dataset (v2.3)"
+        source_note = "Geological Survey of New South Wales"
+
+    if not attributes:
+        return None
+
+    unit_name = pick_first_attr(attributes, [
+        "ru_name", "rockunit", "rock_unit", "unit_name", "name", "strat_name",
+        "geolunit", "legend", "mapunit", "unitname", "formation"
+    ])
+    unit_code = pick_first_attr(attributes, [
+        "ru_symbol", "symbol", "unit_code", "map_symbol", "code", "label", "unitcode"
+    ])
+    age = pick_first_attr(attributes, [
+        "age", "age_name", "era", "period", "epoch", "max_age", "min_age", "age_text"
+    ])
+    lithology = pick_first_attr(attributes, [
+        "lithology", "lith_desc", "lithological_description", "description", "desc_",
+        "rocktype", "rock_type", "dominant_lithology", "lith", "unit_desc"
+    ])
+
+    # Last-resort readable field if the service uses a different schema.
+    if not any([unit_name, unit_code, age, lithology]):
+        readable_values = [
+            str(v).strip()
+            for k, v in attributes.items()
+            if v is not None
+            and str(v).strip()
+            and not str(k).lower().endswith(("id", "fid", "objectid", "shape", "area", "len", "length"))
+        ]
+        if readable_values:
+            unit_name = readable_values[0]
+
+    if not any([unit_name, unit_code, age, lithology]):
+        return None
+
+    return {
+        "unit_name": unit_name,
+        "unit_code": unit_code,
+        "age": age,
+        "lithology": lithology,
+        "source_name": source_name,
+        "source_note": source_note,
+    }
+
+
+def format_surface_geology_context(context: Optional[Dict[str, str]]) -> str:
+    if not context:
+        return ""
+
+    unit_name = safe_str(context.get("unit_name"), "")
+    unit_code = safe_str(context.get("unit_code"), "")
+    age = safe_str(context.get("age"), "")
+    lithology = safe_str(context.get("lithology"), "")
+    source_name = safe_str(context.get("source_name"), "public geological mapping")
+    source_note = safe_str(context.get("source_note"), "")
+
+    unit_bits = []
+    if unit_name:
+        unit_bits.append(unit_name)
+    if unit_code:
+        unit_bits.append(f"({unit_code})")
+    unit_text = " ".join(unit_bits) if unit_bits else "a mapped surface geology unit"
+
+    first_sentence = f"The site is mapped within or near {unit_text}"
+    if age:
+        first_sentence += f", interpreted as {age}"
+    first_sentence += "."
+
+    lith_sentence = ""
+    if lithology:
+        lith_sentence = f"<br/><br/>Mapped lithology / unit description: {lithology}"
+
+    source_sentence = f"<br/><br/>This information is derived from publicly available geological mapping ({source_name})"
+    if source_note:
+        source_sentence += f" — {source_note}"
+    source_sentence += " and is provided for regional context only."
+
+    limitation_sentence = (
+        "<br/><br/>Mapped geology does not account for localised variations such as fill, weathering, reclamation, "
+        "drainage modification, service trenches, demolition, or previous earthworks. Subsurface conditions may differ from mapped units."
+        "<br/><br/>A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
+    )
+
+    return first_sentence + lith_sentence + source_sentence + limitation_sentence
 
 
 def safe_list(value: Any) -> List[Any]:
@@ -5256,6 +5403,8 @@ def build_report_pdf(
     confidence_overall = safe_str(analysis.get("confidence_overall"), "low")
     distinct_features = safe_list(analysis.get("distinct_features"))
     geotechnical_risks = [r for r in safe_list(analysis.get("geotechnical_risks")) if isinstance(r, dict)]
+    surface_geology_context = build_surface_geology_context(resolved)
+    surface_geology_text = format_surface_geology_context(surface_geology_context)
 
     matched_address = resolved.get("matched_address") or payload.address
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
@@ -5310,6 +5459,11 @@ def build_report_pdf(
     story.append(make_underlined_heading("Executive Summary", styles))
     story.append(make_simple_box(summary, styles, width_mm=170))
     story.append(Spacer(1, 4 * mm))
+
+    if surface_geology_text:
+        story.append(make_underlined_heading("Underlying Surface Geology", styles))
+        story.append(make_simple_box(surface_geology_text, styles, width_mm=170))
+        story.append(Spacer(1, 4 * mm))
 
     # Page 2
     story.append(make_underlined_heading("Key Site Risks", styles))
