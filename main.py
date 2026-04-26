@@ -1909,7 +1909,7 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     if reclaimed_ground:
         summary += " Possible reclaimed or canal-edge fill indicators are also visible on-site."
     if structures:
-        summary += " Existing or former built footprints are also visible on-site."
+        summary += " Existing on-site building / development is visible."
     elif disturbances:
         summary += " Site disturbance or possible fill-related ground modification is also visible."
     if water_context_parts:
@@ -1943,7 +1943,7 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         on_site_summary = "No isolated on-site pond was carried through the final interpretation."
 
     if structures:
-        on_site_summary += " Existing or former built footprints are also visible on-site."
+        on_site_summary += " Existing on-site building / development is visible."
     elif disturbances:
         on_site_summary += " Disturbance or possible fill-related ground modification is also visible on-site."
 
@@ -1970,8 +1970,10 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         screening = "No isolated on-site pond was carried through; however, adjacent canal / waterway context and possible canal-edge or reclaimed-ground conditions are relevant to abnormal moisture and fill assessment. Detailed geotechnical investigation is strongly recommended."
     elif drainage_features or coastal_features or external_waterbodies or adjacent_water:
         screening = "Nearby water context is relevant to abnormal moisture assessment under AS2870-style investigation planning. Detailed geotechnical investigation is strongly recommended."
-    elif disturbances or structures:
-        screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
+    elif disturbances:
+        screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance or possible fill-related ground modification is visible. Detailed geotechnical investigation is strongly recommended."
+    elif structures:
+        screening = "Existing on-site building / development is visible. No significant water or disturbance indicators were carried through the final interpretation from available imagery. A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
     else:
         screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Absence of visible indicators does not confirm appropriate or uniform ground conditions, A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
 
@@ -2003,14 +2005,19 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
         for f in flags.get("truth_features", [])
         if safe_str(f.get("location_relation"), "") == "on_site"
     ).lower()
+    structure_risk_text = structure_text_blob + " " + disturbance_text_blob
+    structure_risk_signal = any(k in structure_risk_text for k in [
+        "former", "removed", "demolished", "demolition", "hardstand", "slab",
+        "driveway", "pavement", "service trench", "regrading", "reworked",
+        "earthworks", "cut", "fill", "retaining", "platform preparation"
+    ])
     building_related_disturbance = (
         has_structure_or_hardstand_signal(disturbance_text_blob)
-        or has_structure_or_hardstand_signal(structure_text_blob)
-        or has_structure_or_hardstand_signal(all_on_site_blob)
+        or structure_risk_signal
     )
-    has_embedded_disturbance_signal = has_strong_disturbance_signal(disturbance_text_blob) or has_strong_disturbance_signal(all_on_site_blob)
+    has_embedded_disturbance_signal = has_strong_disturbance_signal(disturbance_text_blob)
 
-    if flags.get("has_disturbance") or flags.get("has_structures") or building_related_disturbance or has_embedded_disturbance_signal:
+    if flags.get("has_disturbance") or building_related_disturbance or has_embedded_disturbance_signal:
         risks.append({
             "title": "Disturbance / Fill Risk",
             "level": "ELEVATED",
@@ -2156,14 +2163,20 @@ def rebuild_findings_notes_from_features(features: List[Dict[str, Any]]) -> Dict
         for f in all_on_site
     ).lower()
 
-    has_building = has_structure_or_hardstand_signal(full_evidence_blob)
-    has_disturbance_signal = has_strong_disturbance_signal(full_evidence_blob)
+    structure_risk_signal = any(k in full_evidence_blob for k in [
+        "former structure", "former dwelling", "removed structure", "demolished",
+        "demolition", "hardstand", "slab", "driveway", "pavement",
+        "service trench", "regrading", "reworked", "earthworks", "cut",
+        "fill", "retaining", "platform preparation"
+    ])
+    has_building_disturbance = has_structure_or_hardstand_signal(disturbance_text_blob) or structure_risk_signal
+    has_disturbance_signal = has_strong_disturbance_signal(disturbance_text_blob)
 
-    if disturbances or has_building or has_disturbance_signal:
-        if has_building or has_structure_or_hardstand_signal(disturbance_text_blob):
+    if disturbances or has_building_disturbance or has_disturbance_signal:
+        if has_building_disturbance:
             fill_status = "possible"
             fill_conf = "medium"
-            fill_note = "Existing building / hardstand footprints and associated on-site disturbance are visible, indicating prior localised ground modification. Cut/fill conditions cannot be confirmed from imagery alone."
+            fill_note = "Former structures, hardstand, slabs, driveways or associated on-site disturbance are visible, indicating prior localised ground modification. Cut/fill conditions cannot be confirmed from imagery alone."
         elif disturbances or has_disturbance_signal:
             fill_status = "possible"
             fill_conf = "medium"
@@ -3422,8 +3435,11 @@ Identify separately:
 - former_structure
 - hardstand_or_slab
 - driveway or building platform if clear
+Always return an existing_structure candidate where a clear on-site dwelling, house, building roof, shed, or obvious structure is visible in current_site/current_context imagery.
+Existing residential dwellings should be reported as a visible site observation even where they are not a geotechnical risk feature.
+Do NOT treat an ordinary existing dwelling as fill_or_disturbance unless there is separate visible evidence of demolition, earthworks, regrading, slab preparation, hardstand construction, retaining, cut/fill, or disturbed ground.
 Look for roofs, rectangular slabs, sheds, dwellings, hardstand, driveways, removed structures in historical comparison, or former building footprints.
-Structures, slabs, hardstand and driveways may indicate localised regrading, service trenches, compaction variation, demolition fill, or altered surface drainage.
+Former structures, slabs, hardstand and driveways may indicate localised regrading, service trenches, compaction variation, demolition fill, or altered surface drainage.
 
 AS2870-RELEVANT SCREENING FACTORS:
 Where visible from imagery, consider:
