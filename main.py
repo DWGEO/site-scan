@@ -1970,7 +1970,12 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     elif disturbances or structures:
         screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
-        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Absence of visible indicators does not confirm appropriate or uniform ground conditions, A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
+        screening = (
+            "No definitive water or disturbance indicators were carried through the final interpretation from available imagery. "
+            "Where historical imagery includes earthworks, exposed ground, or site preparation, this may represent cut, fill, or a combination of both; "
+            "the presence and extent of any placed fill cannot be confirmed from imagery alone. "
+            "A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
+        )
 
     return {
         "summary": dedupe_sentences(summary),
