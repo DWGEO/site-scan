@@ -1970,7 +1970,7 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     elif disturbances or structures:
         screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
-        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Normal geotechnical due diligence still applies."
+        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Absence of visible indicators does not confirm uniform subsurface conditions; normal geotechnical due diligence still applies."
 
     return {
         "summary": dedupe_sentences(summary),
@@ -5221,16 +5221,7 @@ def build_report_pdf(
     distinct_features = safe_list(analysis.get("distinct_features"))
     geotechnical_risks = [r for r in safe_list(analysis.get("geotechnical_risks")) if isinstance(r, dict)]
 
-    def truncate_address(addr, max_len=60):
-        if not addr:
-            return ""
-        if len(addr) <= max_len:
-            return addr
-        return addr[:max_len].rsplit(" ", 1)[0] + "..."
-
-    matched_address = truncate_address(
-        resolved.get("matched_address") or payload.address
-    )
+    matched_address = resolved.get("matched_address") or payload.address
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
     lot_area_text = f"{lot_area_m2:,.0f} m²" if isinstance(lot_area_m2, (int, float)) else "Not available"
     years_scanned = sorted({int(img.get("year")) for img in images if isinstance(img.get("year"), int)})
@@ -5359,7 +5350,7 @@ def build_report_pdf(
         story.append(PageBreak())
         story.append(make_underlined_heading("Historical Evidence", styles))
         story.append(Paragraph(
-            "Best historical image showing the clearest former water feature evidence. Annotation boxes have been removed for cleaner presentation.",
+            "Representative historical imagery selected for site-history interpretation. Annotation boxes have been removed for cleaner presentation.",
             styles["BodyTextSmall"]
         ))
         image_bytes = fetch_image_bytes(historical_img.get("url", ""))
@@ -5378,7 +5369,7 @@ def build_report_pdf(
         story.append(PageBreak())
         story.append(make_underlined_heading("Later Comparison Image", styles))
         story.append(Paragraph(
-            "Later imagery used to check whether the historical water feature remains visible or appears altered.",
+            "Later imagery used to compare site conditions and assess whether historical features remain visible or appear altered.",
             styles["BodyTextSmall"]
         ))
         image_bytes = fetch_image_bytes(later_img.get("url", ""))
