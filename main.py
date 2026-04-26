@@ -1970,7 +1970,7 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     elif disturbances or structures:
         screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
-        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Absence of visible indicators does not confirm uniform subsurface conditions; normal geotechnical due diligence still applies."
+        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Absence of visible indicators does not confirm appropriate or uniform ground conditions, A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
 
     return {
         "summary": dedupe_sentences(summary),
@@ -2055,7 +2055,7 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
             "level": "HIGH",
             "text": (
                 "The presence of a current pond or pond-like depression within the site indicates localised moisture influence and potential "
-                "variability in subsurface conditions. Such features are commonly associated with elevated moisture contents, soft or "
+                "variability in ground conditions. Such features are commonly associated with elevated moisture contents, soft or "
                 "compressible soils, and conditions that may contribute to ground movement. These areas may remain seasonally wet or act "
                 "as surface water collection points, which can impact foundation performance and are relevant to abnormal moisture and site classification "
                 "considerations in accordance with AS2870."
