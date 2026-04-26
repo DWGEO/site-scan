@@ -811,7 +811,10 @@ def disturbance_signal_score(text: str) -> int:
         "fill", "disturb", "earthworks", "bare soil", "cleared soil", "material pile",
         "construction", "access road", "structure", "debris", "graded", "compacted",
         "stockpile", "retaining", "cut platform", "benched", "benching", "dwelling",
-        "shed", "slab", "pad", "excavation", "batter"
+        "shed", "slab", "pad", "excavation", "batter", "machine tracks", "dozer tracks",
+        "track marks", "tracked ground", "bulk earthworks", "platform preparation",
+        "earthmoving", "scraped ground", "stripped ground", "cut batter", "fill batter",
+        "bench", "terraced", "terracing", "reworked ground", "site preparation"
     ]:
         if key in t:
             score += 1
@@ -1906,7 +1909,7 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
     if reclaimed_ground:
         summary += " Possible reclaimed or canal-edge fill indicators are also visible on-site."
     if structures:
-        summary += " Earthworks or site disturbance indicators are also visible on-site."
+        summary += " Existing or former built footprints are also visible on-site."
     elif disturbances:
         summary += " Site disturbance or possible fill-related ground modification is also visible."
     if water_context_parts:
@@ -1940,7 +1943,7 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         on_site_summary = "No isolated on-site pond was carried through the final interpretation."
 
     if structures:
-        on_site_summary += " Earthworks or site disturbance indicators are also visible on-site."
+        on_site_summary += " Existing or former built footprints are also visible on-site."
     elif disturbances:
         on_site_summary += " Disturbance or possible fill-related ground modification is also visible on-site."
 
@@ -1958,50 +1961,19 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         adjacent_summary = "No significant adjacent water features were carried through the final interpretation."
 
     if former_ponds and current_ponds:
-        screening = (
-            "A current pond is present on-site and historical imagery also indicates at least one additional former or altered pond / wet depression. "
-            "This water-related history remains the primary visual risk indicator, with any disturbance or earthworks to be considered as a secondary cut/fill or reworked-ground consideration. "
-            "Detailed geotechnical investigation is strongly recommended."
-        )
+        screening = "A current pond is present on-site and historical imagery also indicates at least one additional former or altered pond / wet depression. Detailed geotechnical investigation is strongly recommended."
     elif former_ponds or probable_ponds:
-        screening = (
-            "Historical imagery indicates former or possible former pond / wet depression signatures on-site. "
-            "This remains the primary visual risk indicator, as these areas may be associated with abnormal moisture conditions, soft ground, or infilled ground. "
-            "Detailed geotechnical investigation is strongly recommended."
-        )
+        screening = "Historical imagery indicates former or possible former pond / wet depression signatures on-site. Detailed geotechnical investigation is strongly recommended."
     elif current_ponds:
-        screening = (
-            "A current isolated on-site water feature is present and should be considered as the primary visual risk indicator for geotechnical assessment. "
-            "Detailed geotechnical investigation is strongly recommended."
-        )
+        screening = "A current isolated on-site water feature is present and should be considered in geotechnical assessment. Detailed geotechnical investigation is strongly recommended."
     elif reclaimed_ground or canals:
-        screening = (
-            "Possible reclaimed ground or canal / waterway context is the primary visual risk indicator. "
-            "These settings may involve placed or reworked ground, groundwater influence and abnormal moisture conditions. "
-            "Detailed geotechnical investigation is strongly recommended."
-        )
-    elif (disturbances or structures) and (drainage_features or coastal_features or external_waterbodies or adjacent_water):
-        screening = (
-            "Recent on-site earthworks, site disturbance or reworked ground are the primary visual risk indicators. "
-            "These works may include cut, fill, or a combination of both; the presence and extent of any placed fill cannot be confirmed from imagery alone. "
-            "Nearby water or drainage context should also be considered for abnormal moisture assessment in accordance with AS2870. "
-            "Detailed geotechnical investigation is strongly recommended."
-        )
-    elif disturbances or structures:
-        screening = (
-            "Recent on-site earthworks, site disturbance or reworked ground are the primary visual risk indicators. "
-            "These works may include cut, fill, or a combination of both; the presence and extent of any placed fill cannot be confirmed from imagery alone. "
-            "Detailed geotechnical investigation is strongly recommended."
-        )
+        screening = "No isolated on-site pond was carried through; however, adjacent canal / waterway context and possible canal-edge or reclaimed-ground conditions are relevant to abnormal moisture and fill assessment. Detailed geotechnical investigation is strongly recommended."
     elif drainage_features or coastal_features or external_waterbodies or adjacent_water:
         screening = "Nearby water context is relevant to abnormal moisture assessment under AS2870-style investigation planning. Detailed geotechnical investigation is strongly recommended."
+    elif disturbances or structures:
+        screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
-        screening = (
-            "No definitive water or disturbance indicators were carried through the final interpretation from available imagery. "
-            "Where historical imagery includes earthworks, exposed ground, or site preparation, this may represent cut, fill, or a combination of both; "
-            "the presence and extent of any placed fill cannot be confirmed from imagery alone. "
-            "A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
-        )
+        screening = "No significant water or disturbance indicators were carried through the final interpretation from available imagery. Absence of visible indicators does not confirm appropriate or uniform ground conditions, A detailed geotechnical investigation is recommended to confirm ground conditions and assess their suitability for residential foundation design in accordance with AS2870."
 
     return {
         "summary": dedupe_sentences(summary),
@@ -2049,8 +2021,8 @@ def build_standard_geotechnical_risks(features: List[Dict[str, Any]]) -> List[Di
                 "Reworked ground may result in variable strength, moisture conditions and overall soil behaviour, which may impact foundation "
                 "performance and footing type if not properly assessed in accordance with AS2870."
                 if not building_related_disturbance else
-                "Earthworks or site disturbance are visible and indicate prior localised ground modification may have occurred. "
-                "These areas can be associated with regrading, platform preparation, service installation, localised excavation, demolition, or localised cut/fill works. "
+                "Existing or former building / hardstand footprints and associated site disturbance indicate prior localised ground modification may have occurred. "
+                "These areas can be associated with regrading, hardstand construction, service installation, slab preparation, demolition, or localised cut/fill works. "
                 "The presence and extent of any placed fill cannot be confirmed from imagery alone. Modified or reworked ground may contribute to variable near-surface conditions, "
                 "foundation performance issues, or differential movement if not properly assessed in accordance with AS2870."
             ),
@@ -2191,7 +2163,7 @@ def rebuild_findings_notes_from_features(features: List[Dict[str, Any]]) -> Dict
         if has_building or has_structure_or_hardstand_signal(disturbance_text_blob):
             fill_status = "possible"
             fill_conf = "medium"
-            fill_note = "Earthworks or on-site disturbance are visible, indicating prior localised ground modification. Cut/fill conditions cannot be confirmed from imagery alone."
+            fill_note = "Existing building / hardstand footprints and associated on-site disturbance are visible, indicating prior localised ground modification. Cut/fill conditions cannot be confirmed from imagery alone."
         elif disturbances or has_disturbance_signal:
             fill_status = "possible"
             fill_conf = "medium"
@@ -3423,7 +3395,7 @@ Look for coastal sand/dune morphology, beach ridges, tidal margins, low-lying co
 FILL / DISTURBANCE INTERPRETATION:
 Look for evidence of:
 - former waterbody or low area becoming developed land
-- earthworks, regrading, filling, levelling, cut/fill platforms, retaining walls, batters
+- earthworks, bulk earthworks, machine tracks, dozer tracks, scraped/stripped ground, regrading, filling, levelling, cut/fill platforms, retaining walls, batters, benching or terracing
 - abrupt tonal changes between years
 - bare ground, stockpiles, access tracks, construction disturbance
 - building pads, slabs, hardstand, driveway construction
@@ -3442,6 +3414,7 @@ Only infer fill more strongly where there is clear visual evidence such as:
 - retaining walls, batters, or edge geometry indicate placed material
 - a platform extends beyond the natural slope alignment
 If these indicators are not clearly present, describe the condition as earthworks / reworked ground with cut/fill unknown and fill presence unconfirmed.
+If machine tracks, benching, terracing, stripped ground, or bulk earthworks are visible within the lot, return an earthworks_candidate or fill_or_disturbance candidate even if no building, slab, hardstand, or water feature is present.
 
 STRUCTURE CLASSIFICATION:
 Identify separately:
@@ -3614,10 +3587,10 @@ def build_features_from_candidates(candidates: List[Dict[str, Any]]) -> List[Dic
             hardstand_hint = raw_type == "hardstand_or_slab" or any(k in text_blob for k in ["hardstand", "slab", "driveway", "pavement"])
             feature["feature_type"] = "former_structure" if historical_hint else "hardstand_or_slab" if hardstand_hint else "existing_structure"
             if not any(k in text_blob for k in ["building", "dwelling", "house", "shed", "slab", "hardstand", "driveway", "structure", "roof"]):
-                prefix = "Earthworks or site disturbance visible" if not historical_hint else "Former site disturbance visible in historical imagery"
+                prefix = "Existing building / hardstand footprint visible" if not historical_hint else "Former building / hardstand footprint visible in historical imagery"
                 feature["notes"] = f"{prefix}. {notes}".strip().strip(".")
             extra_evidence = [
-                "earthworks or site disturbance visible" if not historical_hint else "former building footprint visible",
+                "building / hardstand footprint visible" if not historical_hint else "former building footprint visible",
                 "possible prior localised ground modification",
             ]
             feature["evidence"] = merge_string_lists(evidence + extra_evidence)
@@ -3691,7 +3664,9 @@ def upgrade_geotech_features(features: List[Dict[str, Any]]) -> List[Dict[str, A
             "disturbance", "disturbed ground", "cleared soil", "construction materials",
             "changed land cover", "surface disturbance", "bare soil", "earth scarring", "compacted",
             "retaining", "retaining wall", "cut platform", "benched", "benching", "levelled pad",
-            "batter", "excavation", "dwelling", "house pad", "slab", "hardstand", "shed", "fill", "reworked"
+            "batter", "excavation", "machine tracks", "dozer tracks", "track marks", "tracked ground",
+            "bulk earthworks", "platform preparation", "earthmoving", "scraped ground", "stripped ground",
+            "bench", "terraced", "terracing", "dwelling", "house pad", "slab", "hardstand", "shed", "fill", "reworked"
         ])
         structure_adjacent_signature = any(k in notes or k in evidence_text for k in [
             "near buildings", "near structure", "around structures", "road access", "access road",
