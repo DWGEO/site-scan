@@ -441,7 +441,7 @@ def build_surface_geology_context_image(resolved: Dict[str, Any]) -> Optional[Di
             "&size=900,620"
             "&dpi=120"
             "&format=png32"
-            "&transparent=false"
+            "&transparent=true"
             "&f=image"
             "&layers=show:15"
         )
@@ -456,7 +456,7 @@ def build_surface_geology_context_image(resolved: Dict[str, Any]) -> Optional[Di
             "&size=900,620"
             "&dpi=120"
             "&format=png32"
-            "&transparent=false"
+            "&transparent=true"
             "&f=image"
         )
         source = "NSW Seamless Geology dataset"
@@ -4529,6 +4529,26 @@ def fetch_image_bytes(url: str) -> Optional[bytes]:
         return None
 
 
+def fetch_image_bytes_with_opacity(url: str, opacity: float = 0.30) -> Optional[bytes]:
+    raw = fetch_image_bytes(url)
+    if not raw:
+        return None
+
+    try:
+        from PIL import Image as PILImage
+        img = PILImage.open(BytesIO(raw)).convert("RGBA")
+        alpha = img.getchannel("A")
+        alpha = alpha.point(lambda p: int(p * max(0.0, min(1.0, opacity))))
+        img.putalpha(alpha)
+        output = BytesIO()
+        white_bg = PILImage.new("RGBA", img.size, (255, 255, 255, 255))
+        composited = PILImage.alpha_composite(white_bg, img)
+        composited.convert("RGB").save(output, format="PNG")
+        return output.getvalue()
+    except Exception:
+        return raw
+
+
 def strip_mapbox_polygon_overlay(url: str) -> str:
     url = safe_str(url, "")
     if "/static/geojson(" not in url:
@@ -5471,6 +5491,11 @@ def build_report_pdf(
     geotechnical_risks = [r for r in safe_list(analysis.get("geotechnical_risks")) if isinstance(r, dict)]
     surface_geology_context = build_surface_geology_context(resolved)
     surface_geology_text = format_surface_geology_context(surface_geology_context)
+    surface_geology_text = surface_geology_text or (
+        "Mapped surface regional geology could not be automatically retrieved for this site from the available public geology service.<br/><br/>"
+        "Mapped geology is provided for regional context only and does not replace intrusive geotechnical investigation.<br/><br/>"
+        "A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
+    )
     surface_geology_image = build_surface_geology_context_image(resolved)
 
     matched_address = resolved.get("matched_address") or payload.address
@@ -5529,12 +5554,12 @@ def build_report_pdf(
 
     story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
     if surface_geology_image and surface_geology_image.get("url"):
-        geology_img_bytes = fetch_image_bytes(surface_geology_image.get("url"))
+        geology_img_bytes = fetch_image_bytes_with_opacity(surface_geology_image.get("url"), opacity=0.30)
         if geology_img_bytes:
             try:
                 story.append(centered_flowable(
-                    Image(BytesIO(geology_img_bytes), width=170 * mm, height=112 * mm),
-                    total_width_mm=170
+                    Image(BytesIO(geology_img_bytes), width=150 * mm, height=98 * mm),
+                    total_width_mm=150
                 ))
                 story.append(Paragraph(
                     "Figure: Regional mapped surface geology context around the site. Geological mapping is provided for context only.",
