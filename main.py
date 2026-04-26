@@ -63,8 +63,8 @@ QLD_SURFACE_GEOLOGY_LAYER_URL = (
     "GeoscientificInformation/GeologyDetailed/MapServer/15"
 )
 NSW_SEAMLESS_GEOLOGY_LAYER_URL = (
-    "https://mapprod2.environment.nsw.gov.au/arcgis/rest/services/"
-    "Geology/NSW_SeamlessGeology_DLO/MapServer/0"
+    "https://gs-seamless.geoscience.nsw.gov.au/arcgis/rest/services/"
+    "Geology/Geology_100K/MapServer/0"
 )
 
 REQUEST_TIMEOUT = 25
@@ -311,9 +311,9 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     except Exception:
         return None
 
+    attributes = None
     source_name = ""
     source_note = ""
-    attributes = None
 
     if is_likely_qld(lat, lng):
         attributes = query_arcgis_point_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, lat, lng)
@@ -321,7 +321,7 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
         source_note = "State of Queensland (Department of Resources), CC BY 4.0"
     elif is_likely_nsw(lat, lng):
         attributes = query_arcgis_point_layer(NSW_SEAMLESS_GEOLOGY_LAYER_URL, lat, lng)
-        source_name = "NSW Seamless Geology dataset (v2.3)"
+        source_name = "NSW Seamless Geology dataset"
         source_note = "Geological Survey of New South Wales"
 
     if not attributes:
@@ -329,30 +329,32 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
 
     unit_name = pick_first_attr(attributes, [
         "ru_name", "rockunit", "rock_unit", "unit_name", "name", "strat_name",
-        "geolunit", "legend", "mapunit", "unitname", "formation"
+        "geolunit", "legend", "mapunit", "unitname", "formation", "unit"
     ])
     unit_code = pick_first_attr(attributes, [
-        "ru_symbol", "symbol", "unit_code", "map_symbol", "code", "label", "unitcode"
+        "ru_symbol", "symbol", "unit_code", "map_symbol", "code", "label", "unitcode", "mapunit_symbol"
     ])
     age = pick_first_attr(attributes, [
-        "age", "age_name", "era", "period", "epoch", "max_age", "min_age", "age_text"
+        "age", "age_name", "era", "period", "epoch", "max_age", "min_age", "age_text", "unit_age"
     ])
     lithology = pick_first_attr(attributes, [
         "lithology", "lith_desc", "lithological_description", "description", "desc_",
-        "rocktype", "rock_type", "dominant_lithology", "lith", "unit_desc"
+        "rocktype", "rock_type", "dominant_lithology", "lith", "unit_desc", "lith_sum", "lith_desc_"
     ])
 
-    # Last-resort readable field if the service uses a different schema.
     if not any([unit_name, unit_code, age, lithology]):
         readable_values = [
             str(v).strip()
             for k, v in attributes.items()
             if v is not None
             and str(v).strip()
+            and str(v).strip().lower() not in ("null", "none")
             and not str(k).lower().endswith(("id", "fid", "objectid", "shape", "area", "len", "length"))
         ]
         if readable_values:
             unit_name = readable_values[0]
+            if len(readable_values) > 1:
+                lithology = readable_values[1]
 
     if not any([unit_name, unit_code, age, lithology]):
         return None
@@ -369,7 +371,11 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
 
 def format_surface_geology_context(context: Optional[Dict[str, str]]) -> str:
     if not context:
-        return ""
+        return (
+            "Mapped surface geology could not be automatically retrieved for this site from the available public geology service."
+            "<br/><br/>Mapped geology is provided for regional context only and does not replace intrusive geotechnical investigation."
+            "<br/><br/>A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
+        )
 
     unit_name = safe_str(context.get("unit_name"), "")
     unit_code = safe_str(context.get("unit_code"), "")
@@ -5460,10 +5466,9 @@ def build_report_pdf(
     story.append(make_simple_box(summary, styles, width_mm=170))
     story.append(Spacer(1, 4 * mm))
 
-    if surface_geology_text:
-        story.append(make_underlined_heading("Underlying Surface Geology", styles))
-        story.append(make_simple_box(surface_geology_text, styles, width_mm=170))
-        story.append(Spacer(1, 4 * mm))
+    story.append(make_underlined_heading("Underlying Surface Geology", styles))
+    story.append(make_simple_box(surface_geology_text, styles, width_mm=170))
+    story.append(Spacer(1, 4 * mm))
 
     # Page 2
     story.append(make_underlined_heading("Key Site Risks", styles))
