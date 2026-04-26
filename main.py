@@ -1958,17 +1958,43 @@ def build_truth_layer_from_features(features: List[Dict[str, Any]]) -> Dict[str,
         adjacent_summary = "No significant adjacent water features were carried through the final interpretation."
 
     if former_ponds and current_ponds:
-        screening = "A current pond is present on-site and historical imagery also indicates at least one additional former or altered pond / wet depression. Detailed geotechnical investigation is strongly recommended."
+        screening = (
+            "A current pond is present on-site and historical imagery also indicates at least one additional former or altered pond / wet depression. "
+            "This water-related history remains the primary visual risk indicator, with any disturbance or earthworks to be considered as a secondary cut/fill or reworked-ground consideration. "
+            "Detailed geotechnical investigation is strongly recommended."
+        )
     elif former_ponds or probable_ponds:
-        screening = "Historical imagery indicates former or possible former pond / wet depression signatures on-site. Detailed geotechnical investigation is strongly recommended."
+        screening = (
+            "Historical imagery indicates former or possible former pond / wet depression signatures on-site. "
+            "This remains the primary visual risk indicator, as these areas may be associated with abnormal moisture conditions, soft ground, or infilled ground. "
+            "Detailed geotechnical investigation is strongly recommended."
+        )
     elif current_ponds:
-        screening = "A current isolated on-site water feature is present and should be considered in geotechnical assessment. Detailed geotechnical investigation is strongly recommended."
+        screening = (
+            "A current isolated on-site water feature is present and should be considered as the primary visual risk indicator for geotechnical assessment. "
+            "Detailed geotechnical investigation is strongly recommended."
+        )
     elif reclaimed_ground or canals:
-        screening = "No isolated on-site pond was carried through; however, adjacent canal / waterway context and possible canal-edge or reclaimed-ground conditions are relevant to abnormal moisture and fill assessment. Detailed geotechnical investigation is strongly recommended."
+        screening = (
+            "Possible reclaimed ground or canal / waterway context is the primary visual risk indicator. "
+            "These settings may involve placed or reworked ground, groundwater influence and abnormal moisture conditions. "
+            "Detailed geotechnical investigation is strongly recommended."
+        )
+    elif (disturbances or structures) and (drainage_features or coastal_features or external_waterbodies or adjacent_water):
+        screening = (
+            "Recent on-site earthworks, built footprints or reworked ground are the primary visual risk indicators. "
+            "These works may include cut, fill, or a combination of both; the presence and extent of any placed fill cannot be confirmed from imagery alone. "
+            "Nearby water or drainage context should also be considered for abnormal moisture assessment in accordance with AS2870. "
+            "Detailed geotechnical investigation is strongly recommended."
+        )
+    elif disturbances or structures:
+        screening = (
+            "Recent on-site earthworks, built footprints or reworked ground are the primary visual risk indicators. "
+            "These works may include cut, fill, or a combination of both; the presence and extent of any placed fill cannot be confirmed from imagery alone. "
+            "Detailed geotechnical investigation is strongly recommended."
+        )
     elif drainage_features or coastal_features or external_waterbodies or adjacent_water:
         screening = "Nearby water context is relevant to abnormal moisture assessment under AS2870-style investigation planning. Detailed geotechnical investigation is strongly recommended."
-    elif disturbances or structures:
-        screening = "No isolated on-site pond was carried through the final interpretation; however, local disturbance, built footprints, or possible fill-related ground modification are visible. Detailed geotechnical investigation is strongly recommended."
     else:
         screening = (
             "No definitive water or disturbance indicators were carried through the final interpretation from available imagery. "
