@@ -31,6 +31,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
     Flowable,
+    Image,
 )
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfbase import pdfmetrics
@@ -412,6 +413,65 @@ def format_surface_geology_context(context: Optional[Dict[str, str]]) -> str:
     )
 
     return first_sentence + lith_sentence + source_sentence + limitation_sentence
+
+
+
+def build_surface_geology_context_image(resolved: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        lat = float(resolved.get("lat"))
+        lng = float(resolved.get("lng"))
+    except Exception:
+        return None
+
+    buffer_deg = 0.012
+    bbox = {
+        "xmin": lng - buffer_deg,
+        "ymin": lat - buffer_deg,
+        "xmax": lng + buffer_deg,
+        "ymax": lat + buffer_deg,
+    }
+
+    if is_likely_qld(lat, lng):
+        url = (
+            "https://spatial-gis.information.qld.gov.au/arcgis/rest/services/"
+            "GeoscientificInformation/GeologyDetailed/MapServer/export"
+            f"?bbox={bbox['xmin']},{bbox['ymin']},{bbox['xmax']},{bbox['ymax']}"
+            "&bboxSR=4326"
+            "&imageSR=4326"
+            "&size=900,620"
+            "&dpi=120"
+            "&format=png32"
+            "&transparent=false"
+            "&f=image"
+            "&layers=show:15"
+        )
+        source = "QSpatial / GeologyDetailed - Detailed surface geology"
+    elif is_likely_nsw(lat, lng):
+        url = (
+            "https://gs-seamless.geoscience.nsw.gov.au/arcgis/rest/services/"
+            "Geology/Geology_100K/MapServer/export"
+            f"?bbox={bbox['xmin']},{bbox['ymin']},{bbox['xmax']},{bbox['ymax']}"
+            "&bboxSR=4326"
+            "&imageSR=4326"
+            "&size=900,620"
+            "&dpi=120"
+            "&format=png32"
+            "&transparent=false"
+            "&f=image"
+        )
+        source = "NSW Seamless Geology dataset"
+    else:
+        return None
+
+    return {
+        "label": "surface_regional_geology_context",
+        "type": "geology_context",
+        "year": "current",
+        "capture_date": None,
+        "source": source,
+        "url": url,
+        "bbox": bbox,
+    }
 
 
 def safe_list(value: Any) -> List[Any]:
@@ -5411,6 +5471,7 @@ def build_report_pdf(
     geotechnical_risks = [r for r in safe_list(analysis.get("geotechnical_risks")) if isinstance(r, dict)]
     surface_geology_context = build_surface_geology_context(resolved)
     surface_geology_text = format_surface_geology_context(surface_geology_context)
+    surface_geology_image = build_surface_geology_context_image(resolved)
 
     matched_address = resolved.get("matched_address") or payload.address
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
@@ -5466,7 +5527,22 @@ def build_report_pdf(
     story.append(make_simple_box(summary, styles, width_mm=170))
     story.append(Spacer(1, 4 * mm))
 
-    story.append(make_underlined_heading("Underlying Surface Geology", styles))
+    story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
+    if surface_geology_image and surface_geology_image.get("url"):
+        geology_img_bytes = fetch_image_bytes(surface_geology_image.get("url"))
+        if geology_img_bytes:
+            try:
+                story.append(centered_flowable(
+                    Image(BytesIO(geology_img_bytes), width=170 * mm, height=112 * mm),
+                    total_width_mm=170
+                ))
+                story.append(Paragraph(
+                    "Figure: Regional mapped surface geology context around the site. Geological mapping is provided for context only.",
+                    styles["TinyMuted"]
+                ))
+                story.append(Spacer(1, 3 * mm))
+            except Exception:
+                pass
     story.append(make_simple_box(surface_geology_text, styles, width_mm=170))
     story.append(Spacer(1, 4 * mm))
 
