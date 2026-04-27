@@ -4540,6 +4540,23 @@ def should_run_remainder_rescan(analysis: Dict[str, Any], polygon_present: bool)
     return False
 
 
+def merge_image_lists_by_label(*image_groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Preserve image metadata from initial + follow-up passes so detected features keep valid bbox mapping."""
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for group in image_groups:
+        for img in safe_list(group):
+            if not isinstance(img, dict):
+                continue
+            label = safe_str(img.get("label"), "")
+            key = label or safe_str(img.get("url"), "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(img)
+    return merged
+
+
 def merge_unique_feature_lists(base_features: List[Dict[str, Any]], extra_features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     unique = []
     seen = set()
@@ -6127,8 +6144,21 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
             )
             followup_ran = True
 
-    analysis_after_followup = followup_analysis if followup_analysis else initial_analysis
-    images_after_followup = followup_images if followup_images else initial_images
+    # IMPORTANT: follow-up / hunter passes must be additive, not replacing the first pass.
+    # The first pass often carries the obvious current pond/depression evidence; replacing it
+    # with a narrower follow-up pass can accidentally drop ponds from the final report.
+    if followup_analysis:
+        images_after_followup = merge_image_lists_by_label(initial_images, followup_images)
+        image_lookup_after_followup = {img.get("label"): img for img in images_after_followup}
+        analysis_after_followup = merge_analyses(
+            initial_analysis,
+            followup_analysis,
+            resolved=resolved,
+            image_lookup=image_lookup_after_followup,
+        )
+    else:
+        analysis_after_followup = initial_analysis
+        images_after_followup = initial_images
 
     remainder_rescan_ran = False
     remainder_rescan_analysis: Optional[Dict[str, Any]] = None
