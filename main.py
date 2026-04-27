@@ -16,6 +16,7 @@ from io import BytesIO
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Union, Tuple
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -77,6 +78,7 @@ NSW_SEAMLESS_GEOLOGY_LAYER_URL = (
 )
 
 REQUEST_TIMEOUT = 25
+IMAGE_CHECK_WORKERS = int(os.environ.get("IMAGE_CHECK_WORKERS", "10"))
 POLYGON_PAD_M = 8
 CONTEXT_PAD_M = 35
 WIDE_CONTEXT_PAD_M = 90
@@ -322,6 +324,68 @@ def query_arcgis_point_layer(layer_url: str, lat: float, lng: float) -> Optional
     return safe_dict(features[0].get("attributes"))
 
 
+def geojson_feature_contains_point(feature: Dict[str, Any], lng: float, lat: float) -> bool:
+    """Return True where a GeoJSON Polygon/MultiPolygon contains the supplied lon/lat point."""
+    geom = safe_dict(feature.get("geometry"))
+    geom_type = safe_str(geom.get("type"), "")
+    coords = geom.get("coordinates")
+
+    def ring_contains(ring: Any) -> bool:
+        if not isinstance(ring, list) or len(ring) < 3:
+            return False
+        simple_ring = []
+        for pt in ring:
+            if isinstance(pt, list) and len(pt) >= 2:
+                try:
+                    simple_ring.append([float(pt[0]), float(pt[1])])
+                except Exception:
+                    pass
+        if len(simple_ring) < 3:
+            return False
+        simple_ring = ensure_closed_polygon(simple_ring)
+        return point_in_polygon((lng, lat), simple_ring)
+
+    try:
+        if geom_type == "Polygon" and isinstance(coords, list) and coords:
+            return ring_contains(coords[0])
+        if geom_type == "MultiPolygon" and isinstance(coords, list):
+            for poly in coords:
+                if isinstance(poly, list) and poly and ring_contains(poly[0]):
+                    return True
+    except Exception:
+        return False
+
+    return False
+
+
+def pick_qld_geology_attributes_from_bbox(resolved: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fallback geology lookup using the same GeoJSON polygon query used to render the report geology map."""
+    try:
+        lat = float(resolved.get("lat"))
+        lng = float(resolved.get("lng"))
+    except Exception:
+        return None
+
+    bbox = safe_dict(resolved.get("bbox"))
+    if not bbox:
+        bbox = make_square_bbox_from_point(lat, lng, chip_size_m=220)
+
+    # Use a slightly padded bbox so a tiny lot does not miss the geology polygon boundary.
+    query_bbox = expand_bbox_meters(bbox, center_lat=lat, pad_m=120)
+    features = query_qld_geology_geojson_for_bbox(query_bbox)
+    if not features:
+        return None
+
+    # Prefer the polygon containing the site centroid.
+    for feature in features:
+        if geojson_feature_contains_point(feature, lng, lat):
+            return safe_dict(feature.get("properties"))
+
+    # Fallback: use the first returned geology polygon rather than showing a failed geology text block
+    # when the map overlay clearly rendered from the same service.
+    return safe_dict(features[0].get("properties"))
+
+
 def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str, str]]:
     try:
         lat = float(resolved.get("lat"))
@@ -334,7 +398,10 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     source_note = ""
 
     if is_likely_qld(lat, lng):
+        # Primary: point query. Fallback: same GeoJSON polygon/bbox source used for the rendered geology map.
         attributes = query_arcgis_point_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, lat, lng)
+        if not attributes:
+            attributes = pick_qld_geology_attributes_from_bbox(resolved)
         source_name = "QSpatial / GeologyDetailed - Detailed surface geology"
         source_note = "State of Queensland (Department of Resources), CC BY 4.0"
     elif is_likely_nsw(lat, lng):
@@ -3392,22 +3459,50 @@ def build_historical_qld_images(
     }
 
 
-def filter_accessible_images(images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    valid_images = []
-    for image in images:
-        url = image.get("url")
-        if not url:
-            continue
-        try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT, stream=True)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "image" in content_type or any(ext in url.lower() for ext in [".png", ".jpg", ".jpeg"]):
-                valid_images.append(image)
-        except Exception:
-            continue
-    return valid_images
+def _is_accessible_image_item(index_and_image: Tuple[int, Dict[str, Any]]) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Check one image URL. Kept small so filter_accessible_images can run checks in parallel."""
+    index, image = index_and_image
+    url = image.get("url")
+    if not url:
+        return None
 
+    try:
+        # Use a streamed GET because some Mapbox / ArcGIS image URLs do not reliably support HEAD.
+        response = requests.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "image" in content_type or any(ext in url.lower() for ext in [".png", ".jpg", ".jpeg"]):
+            return index, image
+    except Exception:
+        return None
+    return None
+
+
+def filter_accessible_images(images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate image URLs concurrently instead of one-by-one.
+
+    This preserves the original output order, but avoids waiting sequentially for every
+    Mapbox / QLD imagery URL. It is a speed-only change and does not change selection logic.
+    """
+    indexed = [(idx, image) for idx, image in enumerate(images) if image.get("url")]
+    if not indexed:
+        return []
+
+    workers = max(1, min(IMAGE_CHECK_WORKERS, len(indexed)))
+    valid: List[Tuple[int, Dict[str, Any]]] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_is_accessible_image_item, item) for item in indexed]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception:
+                result = None
+            if result:
+                valid.append(result)
+
+    valid.sort(key=lambda x: x[0])
+    return [image for _, image in valid]
 
 def prioritize_ai_images(images: List[Dict[str, Any]], max_images: int = MAX_AI_IMAGES) -> List[Dict[str, Any]]:
     ordered: List[Dict[str, Any]] = []
