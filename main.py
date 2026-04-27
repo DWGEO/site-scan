@@ -422,10 +422,14 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     age = pick_first_attr(attributes, [
         "age", "age_name", "era", "period", "epoch", "max_age", "min_age", "age_text", "unit_age"
     ])
-    lithology = pick_first_attr(attributes, [
-        "lithology", "lith_desc", "lithological_description", "description", "desc_",
-        "rocktype", "rock_type", "dominant_lithology", "lith", "unit_desc", "lith_sum", "lith_desc_"
-    ])
+    # Prefer meaningful descriptive geology fields before broad database classes.
+    lithology = (
+        pick_first_attr(attributes, ["lith_desc", "lithological_description", "unit_desc"]) or
+        pick_first_attr(attributes, ["description", "desc_"]) or
+        pick_first_attr(attributes, ["dominant_lithology", "lithology", "lith", "lith_sum", "lith_desc_"]) or
+        pick_first_attr(attributes, ["rocktype", "rock_type"]) or
+        ""
+    )
 
     if not any([unit_name, unit_code, age, lithology]):
         readable_values = [
