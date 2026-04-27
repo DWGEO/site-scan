@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 
 import os
 import json
-import base64
 import math
 import requests
 import re
@@ -75,9 +74,18 @@ POLYGON_PAD_M = 8
 CONTEXT_PAD_M = 35
 WIDE_CONTEXT_PAD_M = 90
 
-MAX_INITIAL_SCENES = 5
-MAX_FOLLOWUP_SCENES = 8
-MAX_AI_IMAGES = 14
+MAX_INITIAL_SCENES = 4
+MAX_FOLLOWUP_SCENES = 3
+MAX_AI_IMAGES = 8
+
+# Beta speed controls: keep the main scan/report path intact, but avoid the
+# expensive extra passes that were pushing runtime to ~3-4 minutes.
+# Re-enable these later for a slower/deeper scan mode if needed.
+ENABLE_CURRENT_SUBZONE_IMAGES = False
+ENABLE_INITIAL_HISTORICAL_SUBZONE_IMAGES = False
+ENABLE_FOLLOWUP_HISTORICAL_SUBZONE_IMAGES = False
+ENABLE_REMAINDER_RESCAN = False
+ENABLE_HUNTER_MODE = False
 
 REPORTS_DIR = "generated_reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -133,10 +141,6 @@ class SiteRequest(BaseModel):
     polygon: Optional[Union[List[List[float]], str]] = None
     force_geocode: bool = False
     chip_size_m: Optional[int] = None
-    # Optional PNG/JPEG data URL captured directly from the frontend Mapbox geology view.
-    # Preferred for the PDF geology figure because it preserves the exact map-tool styling.
-    geologyMapSnapshot: Optional[str] = None
-    geology_map_snapshot: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -214,11 +218,6 @@ class SiteRequest(BaseModel):
 
                 except Exception:
                     pass
-
-
-        # Accept either camelCase or snake_case geology snapshot keys from the frontend.
-        if not data.get("geologyMapSnapshot") and data.get("geology_map_snapshot"):
-            data["geologyMapSnapshot"] = data.get("geology_map_snapshot")
 
         if not data.get("address"):
             data["address"] = ""
@@ -3243,7 +3242,12 @@ def build_current_mapbox_images(
         if img:
             images.append(img)
 
-    for zone in subzones[:6]:
+    if ENABLE_CURRENT_SUBZONE_IMAGES:
+        current_subzones = subzones[:4]
+    else:
+        current_subzones = []
+
+    for zone in current_subzones:
         img = build_mapbox_bbox_image(
             bbox=zone["bbox"],
             polygon=polygon,
@@ -3375,7 +3379,7 @@ def build_historical_qld_images(
         subzones=subzones,
         label_prefix="historical_qld",
         include_context_for_edge_years=True,
-        include_subzones_for_edge_years=True,
+        include_subzones_for_edge_years=ENABLE_INITIAL_HISTORICAL_SUBZONE_IMAGES,
         prioritize_subzones=False,
     )
 
@@ -4565,23 +4569,6 @@ def fetch_image_bytes(url: str) -> Optional[bytes]:
         return None
 
 
-def decode_frontend_image_data_url(value: Optional[str]) -> Optional[bytes]:
-    """Decode a frontend map canvas PNG/JPEG data URL for use in the PDF."""
-    raw_value = safe_str(value, "").strip()
-    if not raw_value:
-        return None
-
-    try:
-        if raw_value.startswith("data:image") and "," in raw_value:
-            raw_value = raw_value.split(",", 1)[1]
-        decoded = base64.b64decode(raw_value, validate=False)
-        if len(decoded) < 100:
-            return None
-        return decoded
-    except Exception:
-        return None
-
-
 def fetch_image_bytes_with_opacity(url: str, opacity: float = 0.30) -> Optional[bytes]:
     raw = fetch_image_bytes(url)
     if not raw:
@@ -4634,7 +4621,7 @@ def fetch_geology_mapbox_composite_image(geology_image: Dict[str, Any]) -> Optio
 
         # Subtle street/label pass to keep road context visible, QLD-Globe style.
         road_overlay = base.copy()
-        road_overlay.putalpha(28)
+        road_overlay.putalpha(62)
         composed = PILImage.alpha_composite(composed, road_overlay)
 
         output = BytesIO()
@@ -5612,9 +5599,6 @@ def build_report_pdf(
         "A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
     )
     surface_geology_image = build_surface_geology_context_image(resolved)
-    frontend_geology_snapshot_bytes = decode_frontend_image_data_url(
-        payload.geologyMapSnapshot or payload.geology_map_snapshot
-    )
 
     matched_address = compact_report_address(resolved.get("matched_address") or payload.address)
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
@@ -5671,29 +5655,21 @@ def build_report_pdf(
     story.append(Spacer(1, 4 * mm))
 
     story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
-    geology_img_bytes = frontend_geology_snapshot_bytes
-    geology_caption = (
-        "Figure: Regional mapped surface geology context captured from the submitted map view. "
-        "Geological mapping is provided for context only."
-    )
-
-    if not geology_img_bytes and surface_geology_image and surface_geology_image.get("url"):
+    if surface_geology_image and surface_geology_image.get("url"):
         geology_img_bytes = fetch_geology_mapbox_composite_image(surface_geology_image)
-        geology_caption = (
-            "Figure: Regional mapped surface geology context around the site. "
-            "Geological mapping is provided for context only."
-        )
-
-    if geology_img_bytes:
-        try:
-            story.append(centered_flowable(
-                Image(BytesIO(geology_img_bytes), width=150 * mm, height=66 * mm),
-                total_width_mm=150
-            ))
-            story.append(Paragraph(geology_caption, styles["TinyMuted"]))
-            story.append(Spacer(1, 3 * mm))
-        except Exception:
-            pass
+        if geology_img_bytes:
+            try:
+                story.append(centered_flowable(
+                    Image(BytesIO(geology_img_bytes), width=150 * mm, height=78 * mm),
+                    total_width_mm=150
+                ))
+                story.append(Paragraph(
+                    "Figure: Regional mapped surface geology context around the site. Geological mapping is provided for context only.",
+                    styles["TinyMuted"]
+                ))
+                story.append(Spacer(1, 3 * mm))
+            except Exception:
+                pass
     story.append(make_simple_box(surface_geology_text, styles, width_mm=170))
     story.append(Spacer(1, 2.5 * mm))
 
@@ -5868,6 +5844,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
         water_signal=water_signal_initial,
         mode="initial",
         primary_features=None,
+        max_images=MAX_AI_IMAGES,
     )
 
     followup_ran = False
@@ -5895,7 +5872,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
                 subzones=subzones,
                 label_prefix="historical_qld_followup",
                 include_context_for_edge_years=True,
-                include_subzones_for_edge_years=True,
+                include_subzones_for_edge_years=(ENABLE_FOLLOWUP_HISTORICAL_SUBZONE_IMAGES and buried_secondary_risk_exists),
                 prioritize_subzones=buried_secondary_risk_exists,
             )
 
@@ -5909,6 +5886,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
                 water_signal=water_signal_followup,
                 mode="followup",
                 primary_features=get_on_site_water_features(initial_analysis),
+                max_images=MAX_AI_IMAGES,
             )
             followup_ran = True
 
@@ -5918,7 +5896,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
     remainder_rescan_ran = False
     remainder_rescan_analysis: Optional[Dict[str, Any]] = None
 
-    if should_run_remainder_rescan(analysis_after_followup, polygon_present=bool(polygon)):
+    if ENABLE_REMAINDER_RESCAN and should_run_remainder_rescan(analysis_after_followup, polygon_present=bool(polygon)):
         primary_features = get_on_site_water_features(analysis_after_followup)
 
         remainder_candidate_images = [
@@ -5936,7 +5914,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
                 water_signal=water_signal_remainder,
                 mode="remainder_rescan",
                 primary_features=primary_features,
-                max_images=min(12, MAX_AI_IMAGES),
+                max_images=MAX_AI_IMAGES,
             )
             remainder_rescan_ran = True
 
@@ -5964,8 +5942,8 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
     primary_features_for_hunter = get_on_site_water_features(final_analysis)
     established_former_truth = analysis_has_on_site_former_water_evidence(final_analysis)
 
-    if polygon and primary_features_for_hunter:
-        hunter_candidate_images = pick_hunter_images(final_images, primary_features_for_hunter, max_images=min(12, MAX_AI_IMAGES))
+    if ENABLE_HUNTER_MODE and polygon and primary_features_for_hunter:
+        hunter_candidate_images = pick_hunter_images(final_images, primary_features_for_hunter, max_images=MAX_AI_IMAGES)
         if hunter_candidate_images:
             water_signal_hunter = simple_water_indicator(hunter_candidate_images)
             hunter_raw = call_ai_screening(
@@ -5975,7 +5953,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
                 water_signal=water_signal_hunter,
                 mode="hunter",
                 primary_features=primary_features_for_hunter,
-                max_images=min(12, MAX_AI_IMAGES),
+                max_images=MAX_AI_IMAGES,
             )
             hunter_candidates = [
                 f for f in safe_list(hunter_raw.get("distinct_features"))
