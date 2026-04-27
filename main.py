@@ -3742,6 +3742,8 @@ HUNTER MODE:
 - Prefer new or previously unreported on-site features.
 - Low confidence candidates are acceptable.
 - Return up to 4 candidate water features even if subtle.
+- If the trigger feature is earthworks, fill, retaining, hardstand, or reclaimed ground, check nearby and older imagery for subtle former ponds, buried wet depressions, infilled low areas, and additional earthworks/fill indicators.
+- Return clear earthworks/fill candidates if they are newly observed and not just a duplicate of the known trigger feature.
 - current known higher priority features:
 {primary_text if primary_text else "- none provided"}
 """
@@ -4415,14 +4417,35 @@ def hunter_keep_feature(feature: Dict[str, Any], primary_features: List[Dict[str
     # Let later geometry decide on-site vs adjacent, but drop explicit off-site context.
     if relation == "off_site_context":
         return False
-    if ftype not in ("pond", "former_pond", "probable_pond", "depression"):
-        return False
-    if any(k in text for k in ["canal", "foreshore", "beach", "ocean", "bay", "estuary", "shoreline", "tidal flat", "linear waterway"]):
-        return False
-    if not any(k in text for k in ["pond", "water", "basin", "depression", "ring", "wet", "circular", "oval", "dark", "elongated", "irregular", "semi-circular"]):
-        return False
     if conf not in ("low", "medium", "high"):
         return False
+
+    water_types = {"pond", "former_pond", "probable_pond", "depression"}
+    earthworks_types = {"disturbance", "fill_area", "retaining_or_cut_fill", "possible_reclaimed_ground", "hardstand_or_slab", "former_structure"}
+
+    is_water_candidate = ftype in water_types
+    is_earthworks_candidate = ftype in earthworks_types
+
+    if not (is_water_candidate or is_earthworks_candidate):
+        return False
+
+    # Hunter mode is allowed to find subtle former ponds, but should not convert obvious canals/foreshore into ponds.
+    if is_water_candidate:
+        if any(k in text for k in ["canal", "foreshore", "beach", "ocean", "bay", "estuary", "shoreline", "tidal flat", "linear waterway"]):
+            return False
+        if not any(k in text for k in ["pond", "water", "basin", "depression", "ring", "wet", "circular", "oval", "dark", "elongated", "irregular", "semi-circular"]):
+            return False
+
+    if is_earthworks_candidate:
+        if not any(k in text for k in [
+            "fill", "earthworks", "disturb", "reworked", "graded", "cut", "platform",
+            "retaining", "batter", "bench", "terrace", "hardstand", "slab", "former structure",
+            "reclaimed", "low-lying", "infilled", "stockpile", "scraped", "stripped"
+        ]):
+            return False
+        # Do not carry weak generic structure-only detections unless there is actual disturbance/fill language.
+        if ftype in ("hardstand_or_slab", "former_structure") and not any(k in text for k in ["fill", "earthworks", "reworked", "graded", "cut", "platform", "demolition", "reclaimed", "infilled"]):
+            return False
 
     fg = safe_dict(feature.get("geo_bbox"))
     if not fg:
@@ -4434,20 +4457,47 @@ def hunter_keep_feature(feature: Dict[str, Any], primary_features: List[Dict[str
             continue
         overlap = overlap_ratio(fg, eg)
         dist = geo_distance(fg, eg)
-        # Reject clear re-detections of the same primary water feature.
+        # Reject clear re-detections of the same primary feature.
         if overlap > 0.62 or dist < 0.000035:
             return False
 
-    # Gate out weak singleton ghost detections unless they carry former/disappearance language.
-    if conf == "low" and len(years) <= 1:
+    # Gate out weak singleton ghost water detections unless they carry former/disappearance language.
+    if is_water_candidate and conf == "low" and len(years) <= 1:
         if not any(k in text for k in ["former", "infilled", "drained", "disappeared", "no longer visible", "historical"]):
             return False
+
+    # Weak earthworks detections need more than one strong disturbance cue.
+    if is_earthworks_candidate and conf == "low" and disturbance_signal_score(text) < 2:
+        return False
 
     # Obvious adjacent/outside wording is not strong enough to carry through hunter mode.
     if conf == "low" and any(k in text for k in ["outside", "outside boundary", "east-northeast boundary", "adjacent"]):
         return False
 
     return True
+
+
+def get_hunter_trigger_features(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    trigger_types = {
+        "pond", "former_pond", "probable_pond", "depression",
+        "possible_reclaimed_ground", "disturbance", "fill_area", "retaining_or_cut_fill",
+        "hardstand_or_slab", "former_structure",
+    }
+    triggers: List[Dict[str, Any]] = []
+    for feature in safe_list(analysis.get("distinct_features")):
+        if not isinstance(feature, dict):
+            continue
+        if safe_str(feature.get("location_relation"), "on_site") != "on_site":
+            continue
+        if safe_str(feature.get("feature_type"), "other") in trigger_types:
+            triggers.append(feature)
+    return triggers
+
+
+def should_run_hunter(analysis: Dict[str, Any], polygon_present: bool) -> bool:
+    if not polygon_present:
+        return False
+    return bool(get_hunter_trigger_features(analysis))
 
 def needs_secondary_scan(features: List[Dict[str, Any]]) -> bool:
     water_features = [
@@ -6126,10 +6176,10 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
     hunter_mode_ran = False
     hunter_analysis: Optional[Dict[str, Any]] = None
     hunter_candidate_images: List[Dict[str, Any]] = []
-    primary_features_for_hunter = get_on_site_water_features(final_analysis)
+    primary_features_for_hunter = get_hunter_trigger_features(final_analysis)
     established_former_truth = analysis_has_on_site_former_water_evidence(final_analysis)
 
-    if False and polygon and primary_features_for_hunter:
+    if should_run_hunter(final_analysis, polygon_present=bool(polygon)) and primary_features_for_hunter:
         hunter_candidate_images = pick_hunter_images(final_images, primary_features_for_hunter, max_images=min(12, MAX_AI_IMAGES))
         if hunter_candidate_images:
             water_signal_hunter = simple_water_indicator(hunter_candidate_images)
@@ -6253,7 +6303,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
         "hunter_mode": {
             "ran": hunter_mode_ran,
             "reason": (
-                "Low-confidence hunter mode ran to search for subtle secondary former ponds or buried pond footprints not carried through the main clean scan."
+                "Low-confidence hunter mode ran after pond/wet-area or earthworks/fill indicators were found, to search for subtle secondary former ponds, buried pond footprints, or additional disturbance/fill indicators."
                 if hunter_mode_ran
                 else "Hunter mode did not return any new on-site secondary pond candidates."
             ),
