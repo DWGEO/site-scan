@@ -5671,19 +5671,29 @@ def build_report_pdf(
     story.append(Spacer(1, 4 * mm))
 
     story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
-    geology_img_bytes = frontend_geology_snapshot_bytes
+
+    # SURGICAL GEOLOGY FIGURE FIX:
+    # The frontend canvas snapshot can inherit the user's current map style (e.g. satellite)
+    # and the interactive vector geology colours, which produced the pink / satellite-looking
+    # figure in the PDF. For the deliverable, default to the backend-generated composition:
+    # Mapbox streets basemap underneath + official QSpatial geology export above.
+    # The frontend snapshot is kept as an optional emergency fallback only.
+    use_frontend_geology_snapshot = os.environ.get("USE_FRONTEND_GEOLOGY_SNAPSHOT", "false").lower() == "true"
+    geology_img_bytes = frontend_geology_snapshot_bytes if use_frontend_geology_snapshot else None
     geology_caption = (
-        "Figure: Regional mapped surface geology context captured from the submitted map view. "
+        "Figure: Regional mapped surface geology context around the site. "
         "Geological mapping is provided for context only."
     )
 
     if not geology_img_bytes and surface_geology_image and surface_geology_image.get("url"):
         geology_img_bytes = fetch_geology_mapbox_composite_image(surface_geology_image)
+
+    if not geology_img_bytes and frontend_geology_snapshot_bytes:
+        geology_img_bytes = frontend_geology_snapshot_bytes
         geology_caption = (
-            "Figure: Regional mapped surface geology context around the site. "
+            "Figure: Regional mapped surface geology context captured from the submitted map view. "
             "Geological mapping is provided for context only."
         )
-
     if geology_img_bytes:
         try:
             story.append(centered_flowable(
