@@ -54,6 +54,11 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 MAPBOX_BASE_URL = "https://api.mapbox.com/styles/v1/mapbox"
+# Optional custom style paths for static map compositing.
+# If you create a transparent "roads + labels only" style in Mapbox Studio,
+# set MAPBOX_STREETS_OVERLAY_STYLE_PATH to "username/style_id" on Render.
+MAPBOX_GEOLOGY_BASE_STYLE_PATH = os.environ.get("MAPBOX_GEOLOGY_BASE_STYLE_PATH", "mapbox/light-v11").strip()
+MAPBOX_STREETS_OVERLAY_STYLE_PATH = os.environ.get("MAPBOX_STREETS_OVERLAY_STYLE_PATH", "mapbox/streets-v12").strip()
 MAPBOX_GEOCODE_URL = "https://api.mapbox.com/geocoding/v5/mapbox.places"
 
 QLD_IMAGE_SERVER = (
@@ -75,9 +80,9 @@ POLYGON_PAD_M = 8
 CONTEXT_PAD_M = 35
 WIDE_CONTEXT_PAD_M = 90
 
-MAX_INITIAL_SCENES = 4
-MAX_FOLLOWUP_SCENES = 3
-MAX_AI_IMAGES = 8
+MAX_INITIAL_SCENES = 5
+MAX_FOLLOWUP_SCENES = 8
+MAX_AI_IMAGES = 14
 
 REPORTS_DIR = "generated_reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -3243,7 +3248,7 @@ def build_current_mapbox_images(
         if img:
             images.append(img)
 
-    for zone in subzones[:0]:
+    for zone in subzones[:6]:
         img = build_mapbox_bbox_image(
             bbox=zone["bbox"],
             polygon=polygon,
@@ -3263,7 +3268,7 @@ def build_current_mapbox_images(
             "year": "current",
             "capture_date": None,
             "source": "mapbox_centroid_fallback",
-            "url": f"{MAPBOX_BASE_URL}/satellite-streets-v12/static/{lng},{lat},18/700x700?access_token={MAPBOX_TOKEN}",
+            "url": f"{MAPBOX_BASE_URL}/satellite-streets-v12/static/{lng},{lat},18,0,0/700x700?access_token={MAPBOX_TOKEN}",
             "bbox": bbox,
         })
 
@@ -3335,7 +3340,7 @@ def build_historical_images_from_scenes(
                 target_scenes.append(mid)
 
         for scene_idx, scene in enumerate(target_scenes, start=1):
-            for zone in subzones[:0]:
+            for zone in subzones[:6]:
                 chip_url = export_qld_historical_chip(scene=scene, bbox=zone["bbox"], size_px=700)
                 if chip_url:
                     images.append({
@@ -3375,7 +3380,7 @@ def build_historical_qld_images(
         subzones=subzones,
         label_prefix="historical_qld",
         include_context_for_edge_years=True,
-        include_subzones_for_edge_years=False,
+        include_subzones_for_edge_years=True,
         prioritize_subzones=False,
     )
 
@@ -4464,8 +4469,9 @@ def should_run_followup(analysis: Dict[str, Any]) -> bool:
 
 
 def should_run_remainder_rescan(analysis: Dict[str, Any], polygon_present: bool) -> bool:
-    # Beta speed mode: disabled to avoid a third AI vision pass.
-    return False
+    if not polygon_present:
+        return False
+    return needs_secondary_scan(get_on_site_water_features(analysis))
 
 
 def merge_unique_feature_lists(base_features: List[Dict[str, Any]], extra_features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4601,43 +4607,98 @@ def fetch_image_bytes_with_opacity(url: str, opacity: float = 0.30) -> Optional[
         return raw
 
 
-def build_mapbox_streets_bbox_url(bbox: Dict[str, float], size: str = "900x620") -> str:
-    if not MAPBOX_TOKEN:
+def build_mapbox_style_bbox_url(style_path: str, bbox: Dict[str, float], size: str = "900x620") -> str:
+    """Build a Mapbox Static API bbox URL from a style path such as mapbox/light-v11 or username/style_id."""
+    if not MAPBOX_TOKEN or not bbox:
         return ""
+    clean_style = safe_str(style_path, "mapbox/light-v11").strip().strip("/") or "mapbox/light-v11"
     return (
-        f"{MAPBOX_BASE_URL}/streets-v12/static/"
+        f"https://api.mapbox.com/styles/v1/{clean_style}/static/"
         f"[{bbox['xmin']},{bbox['ymin']},{bbox['xmax']},{bbox['ymax']}]"
         f"/{size}?padding=0&access_token={MAPBOX_TOKEN}"
     )
 
 
+def build_mapbox_streets_bbox_url(bbox: Dict[str, float], size: str = "900x620") -> str:
+    # Backwards-compatible helper used elsewhere. Static bbox renders north-up / vertical, not pitched.
+    return build_mapbox_style_bbox_url("mapbox/streets-v12", bbox, size=size)
+
+
+def force_geology_layer_opaque(image_bytes: bytes, target_size: Tuple[int, int]) -> Optional[bytes]:
+    """Force ArcGIS geology polygons to full opacity while keeping true transparent background transparent."""
+    try:
+        from PIL import Image as PILImage, ImageEnhance
+        geology = PILImage.open(BytesIO(image_bytes)).convert("RGBA").resize(target_size)
+        r, g, b, a = geology.split()
+        # ArcGIS map exports often use semi-transparent fill alpha. Make mapped units solid,
+        # but keep genuinely empty pixels transparent.
+        a = a.point(lambda p: 255 if p > 12 else 0)
+        geology.putalpha(a)
+        # Very small colour lift so the geology does not look washed out in the PDF.
+        rgb = PILImage.merge("RGB", geology.split()[:3])
+        rgb = ImageEnhance.Color(rgb).enhance(1.10)
+        geology = PILImage.merge("RGBA", (*rgb.split(), a))
+        out = BytesIO()
+        geology.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 def fetch_geology_mapbox_composite_image(geology_image: Dict[str, Any]) -> Optional[bytes]:
-    """Mapbox streets below + full-strength geology over it for the PDF geology figure."""
+    """
+    Build the report geology figure as:
+    1) Mapbox light basemap underneath, north-up / vertical;
+    2) QSpatial geology polygons forced to full opacity;
+    3) Mapbox streets/labels overlay on top.
+
+    For the cleanest QLD-Globe look, create a custom transparent Mapbox style that contains
+    only roads + labels, then set MAPBOX_STREETS_OVERLAY_STYLE_PATH="username/style_id" on Render.
+    Without that env var, this falls back to a subtle streets-v12 pass.
+    """
     geology_url = safe_str(geology_image.get("url"), "")
     bbox = safe_dict(geology_image.get("bbox"))
     geology_raw = fetch_image_bytes(geology_url)
     if not geology_raw:
         return None
 
-    basemap_raw = fetch_image_bytes(build_mapbox_streets_bbox_url(bbox)) if bbox else None
-    if not basemap_raw:
-        return geology_raw
+    base_url = build_mapbox_style_bbox_url(MAPBOX_GEOLOGY_BASE_STYLE_PATH, bbox) if bbox else ""
+    overlay_url = build_mapbox_style_bbox_url(MAPBOX_STREETS_OVERLAY_STYLE_PATH, bbox) if bbox else ""
+
+    base_raw = fetch_image_bytes(base_url) if base_url else None
+    overlay_raw = fetch_image_bytes(overlay_url) if overlay_url else None
 
     try:
         from PIL import Image as PILImage
-        base = PILImage.open(BytesIO(basemap_raw)).convert("RGBA")
-        geology = PILImage.open(BytesIO(geology_raw)).convert("RGBA").resize(base.size)
 
-        # Geology at native/full opacity over the street basemap.
+        # Start with a light north-up basemap, or white if Mapbox is unavailable.
+        if base_raw:
+            base = PILImage.open(BytesIO(base_raw)).convert("RGBA")
+        else:
+            base = PILImage.new("RGBA", (900, 620), (255, 255, 255, 255))
+
+        solid_geology_bytes = force_geology_layer_opaque(geology_raw, base.size)
+        geology = PILImage.open(BytesIO(solid_geology_bytes or geology_raw)).convert("RGBA").resize(base.size)
+
+        # Solid geology over basemap.
         composed = PILImage.alpha_composite(base, geology)
 
-        # Subtle street/label pass to keep road context visible, QLD-Globe style.
-        road_overlay = base.copy()
-        road_overlay.putalpha(28)
-        composed = PILImage.alpha_composite(composed, road_overlay)
+        # Top streets/labels pass. If a custom transparent overlay style is supplied, preserve it strongly.
+        # Otherwise use a subtle streets-v12 pass so road names/geometry read without bleaching the geology.
+        if overlay_raw:
+            overlay = PILImage.open(BytesIO(overlay_raw)).convert("RGBA").resize(base.size)
+            if MAPBOX_STREETS_OVERLAY_STYLE_PATH != "mapbox/streets-v12":
+                # Assumes custom style background is transparent / near transparent.
+                overlay_alpha = overlay.getchannel("A")
+                overlay_alpha = overlay_alpha.point(lambda p: int(p * 0.95))
+                overlay.putalpha(overlay_alpha)
+            else:
+                # Fallback: standard streets style is not transparent, so keep it light.
+                overlay.putalpha(58)
+            composed = PILImage.alpha_composite(composed, overlay)
 
         output = BytesIO()
-        composed.convert("RGB").save(output, format="PNG")
+        composed.convert("RGB").save(output, format="PNG", optimize=True)
         return output.getvalue()
     except Exception:
         return geology_raw
@@ -5611,9 +5672,10 @@ def build_report_pdf(
         "A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
     )
     surface_geology_image = build_surface_geology_context_image(resolved)
-    frontend_geology_snapshot_bytes = decode_frontend_image_data_url(
-        payload.geologyMapSnapshot or payload.geology_map_snapshot
-    )
+    # Do not use the frontend geology canvas in the PDF: it may inherit user pitch/tilt,
+    # opacity settings, or satellite styling. The report uses a backend north-up/vertical
+    # Mapbox + QSpatial composite for consistency.
+    frontend_geology_snapshot_bytes = None
 
     matched_address = compact_report_address(resolved.get("matched_address") or payload.address)
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
@@ -5670,18 +5732,14 @@ def build_report_pdf(
     story.append(Spacer(1, 4 * mm))
 
     story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
-    geology_img_bytes = frontend_geology_snapshot_bytes
+    geology_img_bytes = None
     geology_caption = (
-        "Figure: Regional mapped surface geology context captured from the submitted map view. "
+        "Figure: Regional mapped surface geology context around the site. "
         "Geological mapping is provided for context only."
     )
 
-    if not geology_img_bytes and surface_geology_image and surface_geology_image.get("url"):
+    if surface_geology_image and surface_geology_image.get("url"):
         geology_img_bytes = fetch_geology_mapbox_composite_image(surface_geology_image)
-        geology_caption = (
-            "Figure: Regional mapped surface geology context around the site. "
-            "Geological mapping is provided for context only."
-        )
 
     if geology_img_bytes:
         try:
@@ -5894,7 +5952,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
                 subzones=subzones,
                 label_prefix="historical_qld_followup",
                 include_context_for_edge_years=True,
-                include_subzones_for_edge_years=False,
+                include_subzones_for_edge_years=True,
                 prioritize_subzones=buried_secondary_risk_exists,
             )
 
@@ -5963,7 +6021,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
     primary_features_for_hunter = get_on_site_water_features(final_analysis)
     established_former_truth = analysis_has_on_site_former_water_evidence(final_analysis)
 
-    if False and polygon and primary_features_for_hunter:
+    if polygon and primary_features_for_hunter:
         hunter_candidate_images = pick_hunter_images(final_images, primary_features_for_hunter, max_images=min(12, MAX_AI_IMAGES))
         if hunter_candidate_images:
             water_signal_hunter = simple_water_indicator(hunter_candidate_images)
