@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 
 import os
 import json
-import base64
 import math
 import requests
 import re
@@ -33,7 +32,6 @@ from reportlab.platypus import (
     TableStyle,
     Flowable,
     Image,
-    KeepTogether,
 )
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfbase import pdfmetrics
@@ -133,10 +131,6 @@ class SiteRequest(BaseModel):
     polygon: Optional[Union[List[List[float]], str]] = None
     force_geocode: bool = False
     chip_size_m: Optional[int] = None
-    # Optional PNG/JPEG data URL captured directly from the frontend Mapbox geology view.
-    # Preferred for the PDF geology figure because it preserves the exact map-tool styling.
-    geologyMapSnapshot: Optional[str] = None
-    geology_map_snapshot: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -215,11 +209,6 @@ class SiteRequest(BaseModel):
                 except Exception:
                     pass
 
-
-        # Accept either camelCase or snake_case geology snapshot keys from the frontend.
-        if not data.get("geologyMapSnapshot") and data.get("geology_map_snapshot"):
-            data["geologyMapSnapshot"] = data.get("geology_map_snapshot")
-
         if not data.get("address"):
             data["address"] = ""
 
@@ -291,72 +280,6 @@ def pick_first_attr(attributes: Dict[str, Any], keys: List[str]) -> str:
     return ""
 
 
-
-def normalise_geology_code(value: str) -> str:
-    """Normalise geology unit codes so Qc-QLD, Qc and qc resolve the same way."""
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    raw = raw.split("-")[0].strip()
-    raw = re.sub(r"[^A-Za-z0-9]", "", raw)
-    return raw.upper()
-
-
-def is_generic_geology_lithology(value: str) -> bool:
-    """Reject broad database classes that read badly in the report."""
-    text = str(value or "").strip().upper()
-    if not text:
-        return True
-    junk_terms = [
-        "STRATIFIED UNIT",
-        "VOLCANIC AND METAMORPHIC",
-        "INCLUDING VOLCANIC",
-        "METAMORPHIC",
-        "UNDIFFERENTIATED STRATIFIED",
-        "UNDIFFERENTIATED UNIT",
-    ]
-    return any(term in text for term in junk_terms)
-
-
-def clean_geology_lithology(value: str) -> str:
-    """Return useful lithology text only; blank out generic database classes."""
-    text = str(value or "").strip()
-    if is_generic_geology_lithology(text):
-        return ""
-    return text
-
-
-QLD_CURATED_UNIT_DESCRIPTIONS = {
-    # Descriptions are intentionally short and report-friendly, matching the style of QLD Globe popups.
-    "QC": "Sand, muddy sand, minor mud and peat; coastal plain deposits (undifferentiated swamps, tidal flats, beach-ridges and dunes).",
-    "QPA": "Clay, silt, sand and gravel; flood-plain alluvium on high terraces.",
-    "QHCB": "Sand, muddy sand, minor mud and peat; coastal plain / coastal barrier deposits.",
-    "QHCA": "Sand, muddy sand, minor mud and peat; coastal plain / tidal flat deposits.",
-    "JW": "Shale, siltstone, sandstone, coal seams.",
-}
-
-
-def curated_qld_geology_description(unit_code: str, unit_name: str, age: str) -> str:
-    """Fallback descriptions for common QLD mapped units when the raw API only returns a generic class."""
-    code = normalise_geology_code(unit_code)
-    name = str(unit_name or "").strip().upper()
-    age_text = str(age or "").strip().upper()
-
-    if code in QLD_CURATED_UNIT_DESCRIPTIONS:
-        return QLD_CURATED_UNIT_DESCRIPTIONS[code]
-
-    # Some attributes carry the code/name in different fields depending on query path.
-    if "WALLOON" in name or "WALLOON COAL" in name:
-        return QLD_CURATED_UNIT_DESCRIPTIONS["JW"]
-    if "FLOOD" in name and "ALLUVIUM" in name:
-        return QLD_CURATED_UNIT_DESCRIPTIONS["QPA"]
-    if "COASTAL" in name or "BEACH" in name or "DUNE" in name or "TIDAL" in name:
-        return QLD_CURATED_UNIT_DESCRIPTIONS["QC"]
-    if "QUATERNARY" in age_text and not code:
-        return "Quaternary surface deposits; likely sand, silt, clay and gravel depending on local geomorphic setting."
-
-    return ""
-
 def is_likely_nsw(lat: float, lng: float) -> bool:
     return (-37.8 <= lat <= -28.0) and (140.5 <= lng <= 154.5)
 
@@ -382,6 +305,51 @@ def query_arcgis_point_layer(layer_url: str, lat: float, lng: float) -> Optional
     return safe_dict(features[0].get("attributes"))
 
 
+
+def query_arcgis_envelope_layer(layer_url: str, bbox: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """More robust geology identify lookup using a small bbox/envelope around the site.
+
+    Some QLD geology units render correctly on the map export, but the point identify
+    query can miss the polygon or return no attribute record. This uses the same
+    ArcGIS layer with a small envelope intersect, then returns the first attribute
+    record so report text still resolves for places like Beaudesert / inland QLD.
+    """
+    if not bbox:
+        return None
+
+    try:
+        xmin = float(bbox.get("xmin"))
+        ymin = float(bbox.get("ymin"))
+        xmax = float(bbox.get("xmax"))
+        ymax = float(bbox.get("ymax"))
+    except Exception:
+        return None
+
+    params = {
+        "f": "json",
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "false",
+        "geometry": json.dumps({
+            "xmin": xmin,
+            "ymin": ymin,
+            "xmax": xmax,
+            "ymax": ymax,
+            "spatialReference": {"wkid": 4326},
+        }),
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": 4326,
+        "spatialRel": "esriSpatialRelIntersects",
+        "resultRecordCount": 5,
+    }
+    data = safe_get(f"{layer_url}/query", params)
+    if not data:
+        return None
+    features = data.get("features") or []
+    if not features:
+        return None
+    return safe_dict(features[0].get("attributes"))
+
 def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str, str]]:
     try:
         lat = float(resolved.get("lat"))
@@ -394,7 +362,13 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     source_note = ""
 
     if is_likely_qld(lat, lng):
-        attributes = query_arcgis_point_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, lat, lng)
+        # Primary: bbox/envelope query. This is more robust for inland QLD units where
+        # the map layer renders correctly but a strict point identify returns no attributes.
+        geology_bbox = safe_dict(resolved.get("bbox")) or make_square_bbox_from_point(lat, lng, chip_size_m=220)
+        geology_bbox = expand_bbox_meters(geology_bbox, center_lat=lat, pad_m=120)
+        attributes = query_arcgis_envelope_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, geology_bbox)
+        if not attributes:
+            attributes = query_arcgis_point_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, lat, lng)
         source_name = "QSpatial / GeologyDetailed - Detailed surface geology"
         source_note = "State of Queensland (Department of Resources), CC BY 4.0"
     elif is_likely_nsw(lat, lng):
@@ -415,15 +389,10 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     age = pick_first_attr(attributes, [
         "age", "age_name", "era", "period", "epoch", "max_age", "min_age", "age_text", "unit_age"
     ])
-    # Prefer meaningful descriptive geology fields and reject broad database classes such as
-    # "STRATIFIED UNIT (INCLUDING VOLCANIC AND METAMORPHIC)".
-    lithology = (
-        clean_geology_lithology(pick_first_attr(attributes, ["lith_desc", "lithological_description", "unit_desc", "lith_sum", "lith_desc_"])) or
-        clean_geology_lithology(pick_first_attr(attributes, ["description", "desc_"])) or
-        clean_geology_lithology(pick_first_attr(attributes, ["dominant_lithology", "lithology", "lith"])) or
-        clean_geology_lithology(pick_first_attr(attributes, ["rocktype", "rock_type"])) or
-        ""
-    )
+    lithology = pick_first_attr(attributes, [
+        "lithology", "lith_desc", "lithological_description", "description", "desc_",
+        "rocktype", "rock_type", "dominant_lithology", "lith", "unit_desc", "lith_sum", "lith_desc_"
+    ])
 
     if not any([unit_name, unit_code, age, lithology]):
         readable_values = [
@@ -460,50 +429,42 @@ def format_surface_geology_context(context: Optional[Dict[str, str]]) -> str:
             "<br/><br/>A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
         )
 
-    unit_name = safe_str(context.get("unit_name"), "").strip()
-    unit_code = safe_str(context.get("unit_code"), "").strip()
-    age = safe_str(context.get("age"), "").strip()
-    lithology_raw = safe_str(context.get("lithology"), "").strip()
+    unit_name = safe_str(context.get("unit_name"), "")
+    unit_code = safe_str(context.get("unit_code"), "")
+    age = safe_str(context.get("age"), "")
+    lithology = safe_str(context.get("lithology"), "")
     source_name = safe_str(context.get("source_name"), "public geological mapping")
     source_note = safe_str(context.get("source_note"), "")
-
-    curated_description = curated_qld_geology_description(unit_code, unit_name, age)
-    lithology_clean = clean_geology_lithology(lithology_raw)
-
-    # Use curated QLD Globe-style text where the API only provides a broad / generic class.
-    if curated_description and (not lithology_clean or is_generic_geology_lithology(lithology_raw)):
-        geology_description = curated_description
-    elif lithology_clean:
-        geology_description = lithology_clean
-    elif curated_description:
-        geology_description = curated_description
-    else:
-        geology_description = "Mapped surface geology unit description is not available from the public attribute fields."
 
     unit_bits = []
     if unit_name:
         unit_bits.append(unit_name)
-    if unit_code and unit_code.lower() not in unit_name.lower():
+    if unit_code:
         unit_bits.append(f"({unit_code})")
-    unit_text = " ".join(unit_bits) if unit_bits else "the mapped surface geology unit"
+    unit_text = " ".join(unit_bits) if unit_bits else "a mapped surface geology unit"
 
     first_sentence = f"The site is mapped within or near {unit_text}"
     if age:
         first_sentence += f", interpreted as {age}"
     first_sentence += "."
 
-    source_sentence = f"<br/><br/>Source: {source_name}"
+    lith_sentence = ""
+    if lithology:
+        lith_sentence = f"<br/><br/>Mapped lithology / unit description: {lithology}"
+
+    source_sentence = f"<br/><br/>This information is derived from publicly available geological mapping ({source_name})"
     if source_note:
         source_sentence += f" — {source_note}"
-    source_sentence += ". Mapping is regional only and should not be relied on as confirmed ground conditions."
+    source_sentence += " and is provided for regional context only."
 
     limitation_sentence = (
-        "<br/><br/>Mapped geology may not identify local fill, reclamation, weathering, demolition, service trenches, "
-        "drainage changes or previous earthworks. A detailed geotechnical investigation is required to confirm "
-        "actual subsurface conditions and AS2870 site classification."
+        "<br/><br/>Mapped geology does not account for localised variations such as fill, weathering, reclamation, "
+        "drainage modification, service trenches, demolition, or previous earthworks. Subsurface conditions may differ from mapped units."
+        "<br/><br/>A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
     )
 
-    return first_sentence + "<br/><br/>" + geology_description + source_sentence + limitation_sentence
+    return first_sentence + lith_sentence + source_sentence + limitation_sentence
+
 
 
 def build_surface_geology_context_image(resolved: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -4619,23 +4580,6 @@ def fetch_image_bytes(url: str) -> Optional[bytes]:
         return None
 
 
-def decode_frontend_image_data_url(value: Optional[str]) -> Optional[bytes]:
-    """Decode a frontend map canvas PNG/JPEG data URL for use in the PDF."""
-    raw_value = safe_str(value, "").strip()
-    if not raw_value:
-        return None
-
-    try:
-        if raw_value.startswith("data:image") and "," in raw_value:
-            raw_value = raw_value.split(",", 1)[1]
-        decoded = base64.b64decode(raw_value, validate=False)
-        if len(decoded) < 100:
-            return None
-        return decoded
-    except Exception:
-        return None
-
-
 def fetch_image_bytes_with_opacity(url: str, opacity: float = 0.30) -> Optional[bytes]:
     raw = fetch_image_bytes(url)
     if not raw:
@@ -4654,68 +4598,6 @@ def fetch_image_bytes_with_opacity(url: str, opacity: float = 0.30) -> Optional[
         return output.getvalue()
     except Exception:
         return raw
-
-
-def build_mapbox_streets_bbox_url(bbox: Dict[str, float], size: str = "900x620") -> str:
-    if not MAPBOX_TOKEN:
-        return ""
-    return (
-        f"{MAPBOX_BASE_URL}/streets-v12/static/"
-        f"[{bbox['xmin']},{bbox['ymin']},{bbox['xmax']},{bbox['ymax']}]"
-        f"/{size}?padding=0&access_token={MAPBOX_TOKEN}"
-    )
-
-
-def fetch_geology_mapbox_composite_image(geology_image: Dict[str, Any]) -> Optional[bytes]:
-    """Mapbox streets below + full-strength geology over it for the PDF geology figure."""
-    geology_url = safe_str(geology_image.get("url"), "")
-    bbox = safe_dict(geology_image.get("bbox"))
-    geology_raw = fetch_image_bytes(geology_url)
-    if not geology_raw:
-        return None
-
-    basemap_raw = fetch_image_bytes(build_mapbox_streets_bbox_url(bbox)) if bbox else None
-    if not basemap_raw:
-        return geology_raw
-
-    try:
-        from PIL import Image as PILImage
-        base = PILImage.open(BytesIO(basemap_raw)).convert("RGBA")
-        geology = PILImage.open(BytesIO(geology_raw)).convert("RGBA").resize(base.size)
-
-        # Geology at native/full opacity over the street basemap.
-        composed = PILImage.alpha_composite(base, geology)
-
-        # Subtle street/label pass to keep road context visible, QLD-Globe style.
-        road_overlay = base.copy()
-        road_overlay.putalpha(62)
-        composed = PILImage.alpha_composite(composed, road_overlay)
-
-        output = BytesIO()
-        composed.convert("RGB").save(output, format="PNG")
-        return output.getvalue()
-    except Exception:
-        return geology_raw
-
-
-def compact_report_address(address: str) -> str:
-    """Shorten long Mapbox addresses so the cover image stays on page 1."""
-    value = safe_str(address, "").strip()
-    if not value:
-        return value
-
-    value = re.sub(r",?\s*Australia\s*$", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bQueensland\b", "QLD", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bNew South Wales\b", "NSW", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bVictoria\b", "VIC", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bSouth Australia\b", "SA", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bWestern Australia\b", "WA", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bTasmania\b", "TAS", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bNorthern Territory\b", "NT", value, flags=re.IGNORECASE)
-    value = re.sub(r"\bAustralian Capital Territory\b", "ACT", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s{2,}", " ", value)
-    value = re.sub(r"\s+,", ",", value)
-    return value.strip(" ,")
 
 
 def strip_mapbox_polygon_overlay(url: str) -> str:
@@ -5207,8 +5089,8 @@ def make_site_details_table(payload: SiteRequest, resolved: Dict[str, Any], styl
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 7),
         ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     return tbl
 
@@ -5251,8 +5133,8 @@ def make_key_flags_table(findings: Dict[str, Any], styles) -> Table:
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 7),
         ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     return tbl
 
@@ -5476,7 +5358,7 @@ class AnnotatedImageFlowable(Flowable):
 
 
 def make_title_details_table(payload: SiteRequest, resolved: Dict[str, Any], confidence_overall: str, styles) -> Table:
-    matched_address = compact_report_address(resolved.get("matched_address") or payload.address)
+    matched_address = resolved.get("matched_address") or payload.address
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
     lot_area_text = f"{lot_area_m2:,.0f} m²" if isinstance(lot_area_m2, (int, float)) else "Not available"
 
@@ -5493,8 +5375,8 @@ def make_title_details_table(payload: SiteRequest, resolved: Dict[str, Any], con
         ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e4e8ef")),
         ("LEFTPADDING", (0, 0), (-1, -1), 7),
         ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     return centered_flowable(tbl, total_width_mm=170)
@@ -5666,11 +5548,8 @@ def build_report_pdf(
         "A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
     )
     surface_geology_image = build_surface_geology_context_image(resolved)
-    frontend_geology_snapshot_bytes = decode_frontend_image_data_url(
-        payload.geologyMapSnapshot or payload.geology_map_snapshot
-    )
 
-    matched_address = compact_report_address(resolved.get("matched_address") or payload.address)
+    matched_address = resolved.get("matched_address") or payload.address
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
     lot_area_text = f"{lot_area_m2:,.0f} m²" if isinstance(lot_area_m2, (int, float)) else "Not available"
     years_scanned = sorted({int(img.get("year")) for img in images if isinstance(img.get("year"), int)})
@@ -5691,65 +5570,57 @@ def build_report_pdf(
     story.append(make_underlined_heading("AI SITE HISTORY REPORT", styles, title=True, beta=True))
     story.append(Spacer(1, 2.2 * mm))
     details_rows = [
-        [Paragraph("<b>Address</b>", styles["TableHeader"]), Paragraph(matched_address, styles["TableCell"])],
+        [Paragraph("<b>Address</b>", styles["TableHeader"]), Paragraph(matched_address, styles["BodyTextSmall"])],
         [Paragraph("<b>Generated</b>", styles["TableHeader"]), Paragraph(datetime.now().strftime('%d %b %Y'), styles["BodyTextSmall"])],
         [Paragraph("<b>Lot size</b>", styles["TableHeader"]), Paragraph(lot_area_text, styles["BodyTextSmall"])],
         [Paragraph("<b>Years scanned</b>", styles["TableHeader"]), Paragraph(years_scanned_text, styles["BodyTextSmall"])],
         [Paragraph("<b>Confidence</b>", styles["TableHeader"]), Paragraph(confidence_overall.title(), styles["BodyTextSmall"])],
     ]
-    details_tbl = Table(details_rows, colWidths=[30 * mm, 128 * mm])
+    details_tbl = Table(details_rows, colWidths=[34 * mm, 124 * mm])
     details_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
         ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#d9dee6")),
         ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e4e8ef")),
         ("LEFTPADDING", (0, 0), (-1, -1), 10),
         ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
     story.append(centered_flowable(details_tbl, total_width_mm=170))
     story.append(Spacer(1, 3 * mm))
     story.append(make_disclaimer_box(styles))
-    story.append(Spacer(1, 2.5 * mm))
+    story.append(Spacer(1, 4 * mm))
 
     if boundary_overview_img:
         story.append(make_underlined_heading("Current Site Overview", styles))
         image_bytes = fetch_image_bytes(report_display_url(boundary_overview_img, keep_boundary_overlay=True))
         if image_bytes:
-            fig = centered_flowable(AnnotatedImageFlowable(image_bytes, [], width_mm=88), total_width_mm=160)
+            fig = centered_flowable(AnnotatedImageFlowable(image_bytes, [], width_mm=95), total_width_mm=160)
             story.append(make_figure_panel(fig, "Figure 1: Current site overview used for automated screening.", styles, width_mm=170))
-        story.append(Spacer(1, 2 * mm))
+        story.append(Spacer(1, 3 * mm))
 
     story.append(make_underlined_heading("Executive Summary", styles))
     story.append(make_simple_box(summary, styles, width_mm=170))
     story.append(Spacer(1, 4 * mm))
 
     story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
-    geology_img_bytes = frontend_geology_snapshot_bytes
-    geology_caption = (
-        "Figure: Regional mapped surface geology context captured from the submitted map view. "
-        "Geological mapping is provided for context only."
-    )
-
-    if not geology_img_bytes and surface_geology_image and surface_geology_image.get("url"):
-        geology_img_bytes = fetch_geology_mapbox_composite_image(surface_geology_image)
-        geology_caption = (
-            "Figure: Regional mapped surface geology context around the site. "
-            "Geological mapping is provided for context only."
-        )
-
-    if geology_img_bytes:
-        try:
-            story.append(centered_flowable(
-                Image(BytesIO(geology_img_bytes), width=150 * mm, height=78 * mm),
-                total_width_mm=150
-            ))
-            story.append(Paragraph(geology_caption, styles["TinyMuted"]))
-            story.append(Spacer(1, 3 * mm))
-        except Exception:
-            pass
+    if surface_geology_image and surface_geology_image.get("url"):
+        geology_img_bytes = fetch_image_bytes_with_opacity(surface_geology_image.get("url"), opacity=0.30)
+        if geology_img_bytes:
+            try:
+                story.append(centered_flowable(
+                    Image(BytesIO(geology_img_bytes), width=150 * mm, height=98 * mm),
+                    total_width_mm=150
+                ))
+                story.append(Paragraph(
+                    "Figure: Regional mapped surface geology context around the site. Geological mapping is provided for context only.",
+                    styles["TinyMuted"]
+                ))
+                story.append(Spacer(1, 3 * mm))
+            except Exception:
+                pass
     story.append(make_simple_box(surface_geology_text, styles, width_mm=170))
-    story.append(Spacer(1, 2.5 * mm))
+    story.append(Spacer(1, 4 * mm))
 
     # Page 2
     story.append(make_underlined_heading("Key Site Risks", styles))
@@ -5789,11 +5660,9 @@ def build_report_pdf(
         safe_dict(findings.get("fill_or_disturbance")).get("notes", ""),
         styles
     ))
-    story.append(Spacer(1, 2.5 * mm))
-    story.append(KeepTogether([
-        make_underlined_heading("Recommendation", styles),
-        make_simple_box(outcome, styles, width_mm=170),
-    ]))
+    story.append(Spacer(1, 4 * mm))
+    story.append(make_underlined_heading("Recommendation", styles))
+    story.append(make_simple_box(outcome, styles, width_mm=170))
 
     # Page 3
     if current_img:
