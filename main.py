@@ -9,12 +9,14 @@ import os
 import json
 import base64
 import math
+import colorsys
 import requests
 import re
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Union, Tuple
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -52,14 +54,13 @@ app.add_middleware(
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "").strip()
-FROM_EMAIL = os.environ.get("FROM_EMAIL", "").strip()
-FROM_NAME = os.environ.get("FROM_NAME", "Site Class Online").strip()
-BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
-
-
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 MAPBOX_BASE_URL = "https://api.mapbox.com/styles/v1/mapbox"
+# Optional custom style paths for static map compositing.
+# If you create a transparent "roads + labels only" style in Mapbox Studio,
+# set MAPBOX_STREETS_OVERLAY_STYLE_PATH to "username/style_id" on Render.
+MAPBOX_GEOLOGY_BASE_STYLE_PATH = os.environ.get("MAPBOX_GEOLOGY_BASE_STYLE_PATH", "mapbox/light-v11").strip()
+MAPBOX_STREETS_OVERLAY_STYLE_PATH = os.environ.get("MAPBOX_STREETS_OVERLAY_STYLE_PATH", "mapbox/streets-v12").strip()
 MAPBOX_GEOCODE_URL = "https://api.mapbox.com/geocoding/v5/mapbox.places"
 
 QLD_IMAGE_SERVER = (
@@ -77,13 +78,14 @@ NSW_SEAMLESS_GEOLOGY_LAYER_URL = (
 )
 
 REQUEST_TIMEOUT = 25
+IMAGE_CHECK_WORKERS = int(os.environ.get("IMAGE_CHECK_WORKERS", "10"))
 POLYGON_PAD_M = 8
 CONTEXT_PAD_M = 35
 WIDE_CONTEXT_PAD_M = 90
 
-MAX_INITIAL_SCENES = 5
-MAX_FOLLOWUP_SCENES = 8
-MAX_AI_IMAGES = 14
+MAX_INITIAL_SCENES = 4
+MAX_FOLLOWUP_SCENES = 3
+MAX_AI_IMAGES = 8
 
 REPORTS_DIR = "generated_reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
@@ -143,9 +145,6 @@ class SiteRequest(BaseModel):
     # Preferred for the PDF geology figure because it preserves the exact map-tool styling.
     geologyMapSnapshot: Optional[str] = None
     geology_map_snapshot: Optional[str] = None
-    email: Optional[str] = None
-    contactEmail: Optional[str] = None
-    customerEmail: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -228,18 +227,6 @@ class SiteRequest(BaseModel):
         # Accept either camelCase or snake_case geology snapshot keys from the frontend.
         if not data.get("geologyMapSnapshot") and data.get("geology_map_snapshot"):
             data["geologyMapSnapshot"] = data.get("geology_map_snapshot")
-
-        # Accept common frontend email field names.
-        if not data.get("email"):
-            data["email"] = (
-                data.get("contactEmail")
-                or data.get("customerEmail")
-                or data.get("contact_email")
-                or data.get("customer_email")
-                or data.get("userEmail")
-                or data.get("user_email")
-                or ""
-            )
 
         if not data.get("address"):
             data["address"] = ""
@@ -337,6 +324,68 @@ def query_arcgis_point_layer(layer_url: str, lat: float, lng: float) -> Optional
     return safe_dict(features[0].get("attributes"))
 
 
+def geojson_feature_contains_point(feature: Dict[str, Any], lng: float, lat: float) -> bool:
+    """Return True where a GeoJSON Polygon/MultiPolygon contains the supplied lon/lat point."""
+    geom = safe_dict(feature.get("geometry"))
+    geom_type = safe_str(geom.get("type"), "")
+    coords = geom.get("coordinates")
+
+    def ring_contains(ring: Any) -> bool:
+        if not isinstance(ring, list) or len(ring) < 3:
+            return False
+        simple_ring = []
+        for pt in ring:
+            if isinstance(pt, list) and len(pt) >= 2:
+                try:
+                    simple_ring.append([float(pt[0]), float(pt[1])])
+                except Exception:
+                    pass
+        if len(simple_ring) < 3:
+            return False
+        simple_ring = ensure_closed_polygon(simple_ring)
+        return point_in_polygon((lng, lat), simple_ring)
+
+    try:
+        if geom_type == "Polygon" and isinstance(coords, list) and coords:
+            return ring_contains(coords[0])
+        if geom_type == "MultiPolygon" and isinstance(coords, list):
+            for poly in coords:
+                if isinstance(poly, list) and poly and ring_contains(poly[0]):
+                    return True
+    except Exception:
+        return False
+
+    return False
+
+
+def pick_qld_geology_attributes_from_bbox(resolved: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Fallback geology lookup using the same GeoJSON polygon query used to render the report geology map."""
+    try:
+        lat = float(resolved.get("lat"))
+        lng = float(resolved.get("lng"))
+    except Exception:
+        return None
+
+    bbox = safe_dict(resolved.get("bbox"))
+    if not bbox:
+        bbox = make_square_bbox_from_point(lat, lng, chip_size_m=220)
+
+    # Use a slightly padded bbox so a tiny lot does not miss the geology polygon boundary.
+    query_bbox = expand_bbox_meters(bbox, center_lat=lat, pad_m=120)
+    features = query_qld_geology_geojson_for_bbox(query_bbox)
+    if not features:
+        return None
+
+    # Prefer the polygon containing the site centroid.
+    for feature in features:
+        if geojson_feature_contains_point(feature, lng, lat):
+            return safe_dict(feature.get("properties"))
+
+    # Fallback: use the first returned geology polygon rather than showing a failed geology text block
+    # when the map overlay clearly rendered from the same service.
+    return safe_dict(features[0].get("properties"))
+
+
 def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str, str]]:
     try:
         lat = float(resolved.get("lat"))
@@ -349,7 +398,10 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     source_note = ""
 
     if is_likely_qld(lat, lng):
+        # Primary: point query. Fallback: same GeoJSON polygon/bbox source used for the rendered geology map.
         attributes = query_arcgis_point_layer(QLD_SURFACE_GEOLOGY_LAYER_URL, lat, lng)
+        if not attributes:
+            attributes = pick_qld_geology_attributes_from_bbox(resolved)
         source_name = "QSpatial / GeologyDetailed - Detailed surface geology"
         source_note = "State of Queensland (Department of Resources), CC BY 4.0"
     elif is_likely_nsw(lat, lng):
@@ -370,10 +422,14 @@ def build_surface_geology_context(resolved: Dict[str, Any]) -> Optional[Dict[str
     age = pick_first_attr(attributes, [
         "age", "age_name", "era", "period", "epoch", "max_age", "min_age", "age_text", "unit_age"
     ])
-    lithology = pick_first_attr(attributes, [
-        "lithology", "lith_desc", "lithological_description", "description", "desc_",
-        "rocktype", "rock_type", "dominant_lithology", "lith", "unit_desc", "lith_sum", "lith_desc_"
-    ])
+    # Prefer meaningful descriptive geology fields before broad database classes.
+    lithology = (
+        pick_first_attr(attributes, ["lith_desc", "lithological_description", "unit_desc"]) or
+        pick_first_attr(attributes, ["description", "desc_"]) or
+        pick_first_attr(attributes, ["dominant_lithology", "lithology", "lith", "lith_sum", "lith_desc_"]) or
+        pick_first_attr(attributes, ["rocktype", "rock_type"]) or
+        ""
+    )
 
     if not any([unit_name, unit_code, age, lithology]):
         readable_values = [
@@ -3284,7 +3340,7 @@ def build_current_mapbox_images(
             "year": "current",
             "capture_date": None,
             "source": "mapbox_centroid_fallback",
-            "url": f"{MAPBOX_BASE_URL}/satellite-streets-v12/static/{lng},{lat},18/700x700?access_token={MAPBOX_TOKEN}",
+            "url": f"{MAPBOX_BASE_URL}/satellite-streets-v12/static/{lng},{lat},18,0,0/700x700?access_token={MAPBOX_TOKEN}",
             "bbox": bbox,
         })
 
@@ -3321,7 +3377,7 @@ def build_historical_images_from_scenes(
                 "url": chip_url,
                 "bbox": bbox,
             })
-
+ 
     if include_context_for_edge_years and context_bbox and scenes:
         edge_scenes = [scenes[0]]
         if len(scenes) > 1:
@@ -3407,22 +3463,50 @@ def build_historical_qld_images(
     }
 
 
-def filter_accessible_images(images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    valid_images = []
-    for image in images:
-        url = image.get("url")
-        if not url:
-            continue
-        try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT, stream=True)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "image" in content_type or any(ext in url.lower() for ext in [".png", ".jpg", ".jpeg"]):
-                valid_images.append(image)
-        except Exception:
-            continue
-    return valid_images
+def _is_accessible_image_item(index_and_image: Tuple[int, Dict[str, Any]]) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """Check one image URL. Kept small so filter_accessible_images can run checks in parallel."""
+    index, image = index_and_image
+    url = image.get("url")
+    if not url:
+        return None
 
+    try:
+        # Use a streamed GET because some Mapbox / ArcGIS image URLs do not reliably support HEAD.
+        response = requests.get(url, timeout=REQUEST_TIMEOUT, stream=True)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "image" in content_type or any(ext in url.lower() for ext in [".png", ".jpg", ".jpeg"]):
+            return index, image
+    except Exception:
+        return None
+    return None
+
+
+def filter_accessible_images(images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate image URLs concurrently instead of one-by-one.
+
+    This preserves the original output order, but avoids waiting sequentially for every
+    Mapbox / QLD imagery URL. It is a speed-only change and does not change selection logic.
+    """
+    indexed = [(idx, image) for idx, image in enumerate(images) if image.get("url")]
+    if not indexed:
+        return []
+
+    workers = max(1, min(IMAGE_CHECK_WORKERS, len(indexed)))
+    valid: List[Tuple[int, Dict[str, Any]]] = []
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_is_accessible_image_item, item) for item in indexed]
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+            except Exception:
+                result = None
+            if result:
+                valid.append(result)
+
+    valid.sort(key=lambda x: x[0])
+    return [image for _, image in valid]
 
 def prioritize_ai_images(images: List[Dict[str, Any]], max_images: int = MAX_AI_IMAGES) -> List[Dict[str, Any]]:
     ordered: List[Dict[str, Any]] = []
@@ -3757,6 +3841,8 @@ HUNTER MODE:
 - Prefer new or previously unreported on-site features.
 - Low confidence candidates are acceptable.
 - Return up to 4 candidate water features even if subtle.
+- If the trigger feature is earthworks, fill, retaining, hardstand, or reclaimed ground, check nearby and older imagery for subtle former ponds, buried wet depressions, infilled low areas, and additional earthworks/fill indicators.
+- Return clear earthworks/fill candidates if they are newly observed and not just a duplicate of the known trigger feature.
 - current known higher priority features:
 {primary_text if primary_text else "- none provided"}
 """
@@ -4430,14 +4516,35 @@ def hunter_keep_feature(feature: Dict[str, Any], primary_features: List[Dict[str
     # Let later geometry decide on-site vs adjacent, but drop explicit off-site context.
     if relation == "off_site_context":
         return False
-    if ftype not in ("pond", "former_pond", "probable_pond", "depression"):
-        return False
-    if any(k in text for k in ["canal", "foreshore", "beach", "ocean", "bay", "estuary", "shoreline", "tidal flat", "linear waterway"]):
-        return False
-    if not any(k in text for k in ["pond", "water", "basin", "depression", "ring", "wet", "circular", "oval", "dark", "elongated", "irregular", "semi-circular"]):
-        return False
     if conf not in ("low", "medium", "high"):
         return False
+
+    water_types = {"pond", "former_pond", "probable_pond", "depression"}
+    earthworks_types = {"disturbance", "fill_area", "retaining_or_cut_fill", "possible_reclaimed_ground", "hardstand_or_slab", "former_structure"}
+
+    is_water_candidate = ftype in water_types
+    is_earthworks_candidate = ftype in earthworks_types
+
+    if not (is_water_candidate or is_earthworks_candidate):
+        return False
+
+    # Hunter mode is allowed to find subtle former ponds, but should not convert obvious canals/foreshore into ponds.
+    if is_water_candidate:
+        if any(k in text for k in ["canal", "foreshore", "beach", "ocean", "bay", "estuary", "shoreline", "tidal flat", "linear waterway"]):
+            return False
+        if not any(k in text for k in ["pond", "water", "basin", "depression", "ring", "wet", "circular", "oval", "dark", "elongated", "irregular", "semi-circular"]):
+            return False
+
+    if is_earthworks_candidate:
+        if not any(k in text for k in [
+            "fill", "earthworks", "disturb", "reworked", "graded", "cut", "platform",
+            "retaining", "batter", "bench", "terrace", "hardstand", "slab", "former structure",
+            "reclaimed", "low-lying", "infilled", "stockpile", "scraped", "stripped"
+        ]):
+            return False
+        # Do not carry weak generic structure-only detections unless there is actual disturbance/fill language.
+        if ftype in ("hardstand_or_slab", "former_structure") and not any(k in text for k in ["fill", "earthworks", "reworked", "graded", "cut", "platform", "demolition", "reclaimed", "infilled"]):
+            return False
 
     fg = safe_dict(feature.get("geo_bbox"))
     if not fg:
@@ -4449,20 +4556,47 @@ def hunter_keep_feature(feature: Dict[str, Any], primary_features: List[Dict[str
             continue
         overlap = overlap_ratio(fg, eg)
         dist = geo_distance(fg, eg)
-        # Reject clear re-detections of the same primary water feature.
+        # Reject clear re-detections of the same primary feature.
         if overlap > 0.62 or dist < 0.000035:
             return False
 
-    # Gate out weak singleton ghost detections unless they carry former/disappearance language.
-    if conf == "low" and len(years) <= 1:
+    # Gate out weak singleton ghost water detections unless they carry former/disappearance language.
+    if is_water_candidate and conf == "low" and len(years) <= 1:
         if not any(k in text for k in ["former", "infilled", "drained", "disappeared", "no longer visible", "historical"]):
             return False
+
+    # Weak earthworks detections need more than one strong disturbance cue.
+    if is_earthworks_candidate and conf == "low" and disturbance_signal_score(text) < 2:
+        return False
 
     # Obvious adjacent/outside wording is not strong enough to carry through hunter mode.
     if conf == "low" and any(k in text for k in ["outside", "outside boundary", "east-northeast boundary", "adjacent"]):
         return False
 
     return True
+
+
+def get_hunter_trigger_features(analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+    trigger_types = {
+        "pond", "former_pond", "probable_pond", "depression",
+        "possible_reclaimed_ground", "disturbance", "fill_area", "retaining_or_cut_fill",
+        "hardstand_or_slab", "former_structure",
+    }
+    triggers: List[Dict[str, Any]] = []
+    for feature in safe_list(analysis.get("distinct_features")):
+        if not isinstance(feature, dict):
+            continue
+        if safe_str(feature.get("location_relation"), "on_site") != "on_site":
+            continue
+        if safe_str(feature.get("feature_type"), "other") in trigger_types:
+            triggers.append(feature)
+    return triggers
+
+
+def should_run_hunter(analysis: Dict[str, Any], polygon_present: bool) -> bool:
+    if not polygon_present:
+        return False
+    return bool(get_hunter_trigger_features(analysis))
 
 def needs_secondary_scan(features: List[Dict[str, Any]]) -> bool:
     water_features = [
@@ -4473,21 +4607,53 @@ def needs_secondary_scan(features: List[Dict[str, Any]]) -> bool:
 
 
 def should_run_followup(analysis: Dict[str, Any]) -> bool:
+    """Run the second AI pass only when the first pass finds pond/wet-area or earthworks/fill signals."""
     findings = ensure_findings_dict(analysis.get("historical_findings"))
     ponds = safe_dict(findings.get("former_ponds_dams"))
     fill = safe_dict(findings.get("fill_or_disturbance"))
 
-    return (
-        ponds.get("status") in ("possible", "likely", "strong_evidence")
-        or fill.get("status") in ("possible", "likely", "strong_evidence")
-        or len(get_on_site_water_features(analysis)) >= 1
-    )
+    if ponds.get("status") in ("possible", "likely", "strong_evidence"):
+        return True
+    if fill.get("status") in ("possible", "likely", "strong_evidence"):
+        return True
+
+    trigger_types = {
+        "pond", "former_pond", "probable_pond", "depression",
+        "possible_reclaimed_ground", "disturbance", "fill_area", "retaining_or_cut_fill",
+        "hardstand_or_slab", "former_structure",
+    }
+    for feature in safe_list(analysis.get("distinct_features")):
+        if not isinstance(feature, dict):
+            continue
+        if safe_str(feature.get("location_relation"), "on_site") != "on_site":
+            continue
+        if safe_str(feature.get("feature_type"), "other") in trigger_types:
+            return True
+
+    return False
 
 
 def should_run_remainder_rescan(analysis: Dict[str, Any], polygon_present: bool) -> bool:
-    if not polygon_present:
-        return False
-    return needs_secondary_scan(get_on_site_water_features(analysis))
+    # Beta execution model: max two AI passes.
+    # Initial pass always runs; follow-up pass runs only if pond / wet-area / earthworks signals are found.
+    return False
+
+
+def merge_image_lists_by_label(*image_groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Preserve image metadata from initial + follow-up passes so detected features keep valid bbox mapping."""
+    merged: List[Dict[str, Any]] = []
+    seen = set()
+    for group in image_groups:
+        for img in safe_list(group):
+            if not isinstance(img, dict):
+                continue
+            label = safe_str(img.get("label"), "")
+            key = label or safe_str(img.get("url"), "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(img)
+    return merged
 
 
 def merge_unique_feature_lists(base_features: List[Dict[str, Any]], extra_features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -4623,47 +4789,194 @@ def fetch_image_bytes_with_opacity(url: str, opacity: float = 0.30) -> Optional[
         return raw
 
 
-def build_mapbox_streets_bbox_url(bbox: Dict[str, float], size: str = "900x620") -> str:
-    if not MAPBOX_TOKEN:
+def build_mapbox_style_bbox_url(style_path: str, bbox: Dict[str, float], size: str = "900x620") -> str:
+    """Build a Mapbox Static API bbox URL from a style path such as mapbox/light-v11 or username/style_id."""
+    if not MAPBOX_TOKEN or not bbox:
         return ""
+    clean_style = safe_str(style_path, "mapbox/light-v11").strip().strip("/") or "mapbox/light-v11"
     return (
-        f"{MAPBOX_BASE_URL}/streets-v12/static/"
+        f"https://api.mapbox.com/styles/v1/{clean_style}/static/"
         f"[{bbox['xmin']},{bbox['ymin']},{bbox['xmax']},{bbox['ymax']}]"
         f"/{size}?padding=0&access_token={MAPBOX_TOKEN}"
     )
 
 
+def build_mapbox_streets_bbox_url(bbox: Dict[str, float], size: str = "900x620") -> str:
+    # Backwards-compatible helper used elsewhere. Static bbox renders north-up / vertical, not pitched.
+    return build_mapbox_style_bbox_url("mapbox/streets-v12", bbox, size=size)
+
+
+def force_geology_layer_opaque(image_bytes: bytes, target_size: Tuple[int, int]) -> Optional[bytes]:
+    """Force ArcGIS geology polygons to full opacity while keeping true transparent background transparent."""
+    try:
+        from PIL import Image as PILImage, ImageEnhance
+        geology = PILImage.open(BytesIO(image_bytes)).convert("RGBA").resize(target_size)
+        r, g, b, a = geology.split()
+        # ArcGIS map exports often use semi-transparent fill alpha. Make mapped units solid,
+        # but keep genuinely empty pixels transparent.
+        a = a.point(lambda p: 255 if p > 12 else 0)
+        geology.putalpha(a)
+        # Very small colour lift so the geology does not look washed out in the PDF.
+        rgb = PILImage.merge("RGB", geology.split()[:3])
+        rgb = ImageEnhance.Color(rgb).enhance(1.10)
+        geology = PILImage.merge("RGBA", (*rgb.split(), a))
+        out = BytesIO()
+        geology.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+
+def frontend_geology_rgb(legend_value: Any) -> Tuple[int, int, int]:
+    """Match the frontend getGeologyFeatureColor() HSL hash logic."""
+    value = str(legend_value or "unknown geology")
+    h = 0
+    for ch in value:
+        h = ord(ch) + ((h << 5) - h)
+    hue = abs(h) % 360
+    r, g, b = colorsys.hls_to_rgb(hue / 360.0, 0.69, 0.46)
+    return int(r * 255), int(g * 255), int(b * 255)
+
+
+def geology_feature_legend_value(feature: Dict[str, Any]) -> str:
+    props = safe_dict(feature.get("properties"))
+    return (
+        props.get("LEGEND")
+        or props.get("legend")
+        or props.get("ru_name")
+        or props.get("RU_NAME")
+        or props.get("name")
+        or props.get("NAME")
+        or "unknown geology"
+    )
+
+
+def query_qld_geology_geojson_for_bbox(bbox: Dict[str, float]) -> List[Dict[str, Any]]:
+    """Use the same QLD layer + GeoJSON query method as the map page."""
+    if not bbox:
+        return []
+    params = {
+        "f": "geojson",
+        "where": "1=1",
+        "outFields": "*",
+        "returnGeometry": "true",
+        "outSR": "4326",
+        "inSR": "4326",
+        "geometryType": "esriGeometryEnvelope",
+        "spatialRel": "esriSpatialRelIntersects",
+        "resultRecordCount": "2000",
+        "geometry": f"{bbox['xmin']},{bbox['ymin']},{bbox['xmax']},{bbox['ymax']}",
+    }
+    data = safe_get(f"{QLD_SURFACE_GEOLOGY_LAYER_URL}/query", params)
+    if not data:
+        return []
+    return [f for f in safe_list(data.get("features")) if isinstance(f, dict)]
+
+
+def geo_point_to_pixel(lng: float, lat: float, bbox: Dict[str, float], width: int, height: int) -> Tuple[int, int]:
+    dx = max(1e-12, bbox["xmax"] - bbox["xmin"])
+    dy = max(1e-12, bbox["ymax"] - bbox["ymin"])
+    x = int(round((lng - bbox["xmin"]) / dx * width))
+    y = int(round((bbox["ymax"] - lat) / dy * height))
+    return x, y
+
+
+def draw_geojson_polygon(draw, coords: Any, bbox: Dict[str, float], size: Tuple[int, int], fill, outline):
+    width, height = size
+    if not isinstance(coords, list) or not coords:
+        return
+    outer = coords[0]
+    if not isinstance(outer, list) or len(outer) < 3:
+        return
+    pts = []
+    for pt in outer:
+        if isinstance(pt, list) and len(pt) >= 2:
+            pts.append(geo_point_to_pixel(float(pt[0]), float(pt[1]), bbox, width, height))
+    if len(pts) >= 3:
+        draw.polygon(pts, fill=fill, outline=outline)
+
+
+def render_frontend_style_qld_geology_layer(bbox: Dict[str, float], target_size: Tuple[int, int]) -> Optional[bytes]:
+    """Render QLD geology to match the map tool: GeoJSON + deterministic HSL fill colours."""
+    features = query_qld_geology_geojson_for_bbox(bbox)
+    if not features:
+        return None
+    try:
+        from PIL import Image as PILImage, ImageDraw
+        layer = PILImage.new("RGBA", target_size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(layer, "RGBA")
+        for feature in features:
+            geom = safe_dict(feature.get("geometry"))
+            geom_type = safe_str(geom.get("type"), "")
+            coords = geom.get("coordinates")
+            rgb = frontend_geology_rgb(geology_feature_legend_value(feature))
+            fill = (*rgb, 190)
+            outline = (90, 90, 90, 95)
+            if geom_type == "Polygon":
+                draw_geojson_polygon(draw, coords, bbox, target_size, fill, outline)
+            elif geom_type == "MultiPolygon":
+                for poly in safe_list(coords):
+                    draw_geojson_polygon(draw, poly, bbox, target_size, fill, outline)
+        out = BytesIO()
+        layer.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 def fetch_geology_mapbox_composite_image(geology_image: Dict[str, Any]) -> Optional[bytes]:
-    """Mapbox streets below + full-strength geology over it for the PDF geology figure."""
+    """
+    Build the report geology figure using the same rendering logic as the map tool:
+    - QLD geology is queried as GeoJSON from MapServer/15;
+    - each polygon gets the same deterministic HSL colour as the frontend;
+    - the image is north-up / vertical via Mapbox Static bbox render;
+    - streets/labels are composited over the geology for readability.
+    """
     geology_url = safe_str(geology_image.get("url"), "")
     bbox = safe_dict(geology_image.get("bbox"))
-    geology_raw = fetch_image_bytes(geology_url)
+    if not bbox:
+        return fetch_image_bytes(geology_url) if geology_url else None
+
+    base_url = build_mapbox_style_bbox_url(MAPBOX_GEOLOGY_BASE_STYLE_PATH, bbox) if bbox else ""
+    overlay_url = build_mapbox_style_bbox_url(MAPBOX_STREETS_OVERLAY_STYLE_PATH, bbox) if bbox else ""
+
+    base_raw = fetch_image_bytes(base_url) if base_url else None
+    overlay_raw = fetch_image_bytes(overlay_url) if overlay_url else None
+    geology_raw = render_frontend_style_qld_geology_layer(bbox, (900, 620))
+
+    if not geology_raw and geology_url:
+        old_export = fetch_image_bytes(geology_url)
+        geology_raw = force_geology_layer_opaque(old_export, (900, 620)) if old_export else None
     if not geology_raw:
         return None
 
-    basemap_raw = fetch_image_bytes(build_mapbox_streets_bbox_url(bbox)) if bbox else None
-    if not basemap_raw:
-        return geology_raw
-
     try:
         from PIL import Image as PILImage
-        base = PILImage.open(BytesIO(basemap_raw)).convert("RGBA")
-        geology = PILImage.open(BytesIO(geology_raw)).convert("RGBA").resize(base.size)
 
-        # Geology at native/full opacity over the street basemap.
+        if base_raw:
+            base = PILImage.open(BytesIO(base_raw)).convert("RGBA")
+        else:
+            base = PILImage.new("RGBA", (900, 620), (255, 255, 255, 255))
+
+        geology = PILImage.open(BytesIO(geology_raw)).convert("RGBA").resize(base.size)
         composed = PILImage.alpha_composite(base, geology)
 
-        # Subtle street/label pass to keep road context visible, QLD-Globe style.
-        road_overlay = base.copy()
-        road_overlay.putalpha(28)
-        composed = PILImage.alpha_composite(composed, road_overlay)
+        if overlay_raw:
+            overlay = PILImage.open(BytesIO(overlay_raw)).convert("RGBA").resize(base.size)
+            if MAPBOX_STREETS_OVERLAY_STYLE_PATH != "mapbox/streets-v12":
+                overlay_alpha = overlay.getchannel("A")
+                overlay_alpha = overlay_alpha.point(lambda p: int(p * 0.95))
+                overlay.putalpha(overlay_alpha)
+            else:
+                overlay.putalpha(64)
+            composed = PILImage.alpha_composite(composed, overlay)
 
         output = BytesIO()
-        composed.convert("RGB").save(output, format="PNG")
+        composed.convert("RGB").save(output, format="PNG", optimize=True)
         return output.getvalue()
     except Exception:
         return geology_raw
-
 
 def compact_report_address(address: str) -> str:
     """Shorten long Mapbox addresses so the cover image stays on page 1."""
@@ -5633,9 +5946,10 @@ def build_report_pdf(
         "A detailed geotechnical investigation is required to confirm actual ground conditions and site classification in accordance with AS2870."
     )
     surface_geology_image = build_surface_geology_context_image(resolved)
-    frontend_geology_snapshot_bytes = decode_frontend_image_data_url(
-        payload.geologyMapSnapshot or payload.geology_map_snapshot
-    )
+    # Do not use the frontend geology canvas in the PDF: it may inherit user pitch/tilt,
+    # opacity settings, or satellite styling. The report uses a backend north-up/vertical
+    # Mapbox + QSpatial composite for consistency.
+    frontend_geology_snapshot_bytes = None
 
     matched_address = compact_report_address(resolved.get("matched_address") or payload.address)
     lot_area_m2 = polygon_area_m2(resolved.get("polygon"))
@@ -5692,18 +6006,14 @@ def build_report_pdf(
     story.append(Spacer(1, 4 * mm))
 
     story.append(make_underlined_heading("Underlying Surface Regional Geology", styles))
-    geology_img_bytes = frontend_geology_snapshot_bytes
+    geology_img_bytes = None
     geology_caption = (
-        "Figure: Regional mapped surface geology context captured from the submitted map view. "
+        "Figure: Regional mapped surface geology context around the site. "
         "Geological mapping is provided for context only."
     )
 
-    if not geology_img_bytes and surface_geology_image and surface_geology_image.get("url"):
+    if surface_geology_image and surface_geology_image.get("url"):
         geology_img_bytes = fetch_geology_mapbox_composite_image(surface_geology_image)
-        geology_caption = (
-            "Figure: Regional mapped surface geology context around the site. "
-            "Geological mapping is provided for context only."
-        )
 
     if geology_img_bytes:
         try:
@@ -5844,70 +6154,6 @@ def build_report_pdf(
     doc.build(story)
     return filename
 
-def normalize_email_address(value: Optional[str]) -> str:
-    email = safe_str(value, "").strip()
-    if not email or "@" not in email or "." not in email.split("@")[-1]:
-        return ""
-    return email
-
-
-def make_public_report_url(request: Request, report_filename: Optional[str]) -> Optional[str]:
-    if not report_filename:
-        return None
-    base_url = BASE_URL or str(request.base_url).rstrip("/")
-    return base_url.rstrip("/") + f"/reports/{report_filename}"
-
-
-def send_report_ready_email(to_email: Optional[str], report_url: Optional[str], address: str) -> Tuple[bool, Optional[str]]:
-    recipient = normalize_email_address(to_email)
-    if not recipient:
-        return False, "No valid recipient email supplied."
-    if not report_url:
-        return False, "No report URL available to email."
-    if not SENDGRID_API_KEY:
-        return False, "SENDGRID_API_KEY not configured."
-    if not FROM_EMAIL:
-        return False, "FROM_EMAIL not configured."
-
-    site_address = safe_str(address, "your selected site").strip() or "your selected site"
-    subject = "Your AI Site History Scan report is ready"
-    text_body = (
-        f"Your AI Site History Scan report for {site_address} is ready.\n\n"
-        f"View your report here:\n{report_url}\n\n"
-        "This scan is a preliminary screening tool only and does not replace a detailed geotechnical investigation."
-    )
-    html_body = (
-        f"<p>Your AI Site History Scan report for <b>{site_address}</b> is ready.</p>"
-        f"<p><a href=\"{report_url}\">View your report</a></p>"
-        "<p style=\"font-size:12px;color:#64748b;\">This scan is a preliminary screening tool only and does not replace a detailed geotechnical investigation.</p>"
-    )
-
-    payload = {
-        "personalizations": [{"to": [{"email": recipient}]}],
-        "from": {"email": FROM_EMAIL, "name": FROM_NAME},
-        "subject": subject,
-        "content": [
-            {"type": "text/plain", "value": text_body},
-            {"type": "text/html", "value": html_body},
-        ],
-    }
-
-    try:
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code not in (200, 202):
-            return False, f"SendGrid returned {response.status_code}: {response.text[:300]}"
-        return True, None
-    except Exception as exc:
-        return False, str(exc)
-
 @app.post("/analyze-site-ai")
 def analyze_site_ai(payload: SiteRequest, request: Request):
     if not os.environ.get("OPENAI_API_KEY"):
@@ -5980,8 +6226,8 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
                 subzones=subzones,
                 label_prefix="historical_qld_followup",
                 include_context_for_edge_years=True,
-                include_subzones_for_edge_years=True,
-                prioritize_subzones=buried_secondary_risk_exists,
+                include_subzones_for_edge_years=False,
+                prioritize_subzones=False,
             )
 
             followup_images = current_images + followup_hist_images
@@ -5997,8 +6243,21 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
             )
             followup_ran = True
 
-    analysis_after_followup = followup_analysis if followup_analysis else initial_analysis
-    images_after_followup = followup_images if followup_images else initial_images
+    # IMPORTANT: follow-up / hunter passes must be additive, not replacing the first pass.
+    # The first pass often carries the obvious current pond/depression evidence; replacing it
+    # with a narrower follow-up pass can accidentally drop ponds from the final report.
+    if followup_analysis:
+        images_after_followup = merge_image_lists_by_label(initial_images, followup_images)
+        image_lookup_after_followup = {img.get("label"): img for img in images_after_followup}
+        analysis_after_followup = merge_analyses(
+            initial_analysis,
+            followup_analysis,
+            resolved=resolved,
+            image_lookup=image_lookup_after_followup,
+        )
+    else:
+        analysis_after_followup = initial_analysis
+        images_after_followup = initial_images
 
     remainder_rescan_ran = False
     remainder_rescan_analysis: Optional[Dict[str, Any]] = None
@@ -6046,10 +6305,10 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
     hunter_mode_ran = False
     hunter_analysis: Optional[Dict[str, Any]] = None
     hunter_candidate_images: List[Dict[str, Any]] = []
-    primary_features_for_hunter = get_on_site_water_features(final_analysis)
+    primary_features_for_hunter = get_hunter_trigger_features(final_analysis)
     established_former_truth = analysis_has_on_site_former_water_evidence(final_analysis)
 
-    if polygon and primary_features_for_hunter:
+    if should_run_hunter(final_analysis, polygon_present=bool(polygon)) and primary_features_for_hunter:
         hunter_candidate_images = pick_hunter_images(final_images, primary_features_for_hunter, max_images=min(12, MAX_AI_IMAGES))
         if hunter_candidate_images:
             water_signal_hunter = simple_water_indicator(hunter_candidate_images)
@@ -6113,9 +6372,6 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
     report_filename = None
     report_url = None
     report_error = None
-    report_email_sent = False
-    report_email_error = None
-    report_email_to = normalize_email_address(payload.email or payload.contactEmail or payload.customerEmail)
 
     try:
         report_filename = build_report_pdf(
@@ -6125,8 +6381,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
             analysis=final_analysis,
         )
         report_generated = True
-        report_url = make_public_report_url(request, report_filename)
-        report_email_sent, report_email_error = send_report_ready_email(report_email_to, report_url, payload.address)
+        report_url = str(request.base_url).rstrip("/") + f"/reports/{report_filename}"
     except Exception as exc:
         report_error = str(exc)
 
@@ -6177,7 +6432,7 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
         "hunter_mode": {
             "ran": hunter_mode_ran,
             "reason": (
-                "Low-confidence hunter mode ran to search for subtle secondary former ponds or buried pond footprints not carried through the main clean scan."
+                "Low-confidence hunter mode ran after pond/wet-area or earthworks/fill indicators were found, to search for subtle secondary former ponds, buried pond footprints, or additional disturbance/fill indicators."
                 if hunter_mode_ran
                 else "Hunter mode did not return any new on-site secondary pond candidates."
             ),
@@ -6190,7 +6445,4 @@ def analyze_site_ai(payload: SiteRequest, request: Request):
         "report_filename": report_filename,
         "report_url": report_url,
         "report_error": report_error,
-        "report_email_to": report_email_to,
-        "report_email_sent": report_email_sent,
-        "report_email_error": report_email_error,
     }
